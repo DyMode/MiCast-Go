@@ -104,3 +104,31 @@ func TestUnsafeArchivePathsRejected(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeManifestPreservesMultilineDescription(t *testing.T) {
+	source := "appname=micast-go\r\nplatform=x86\r\ndesc=\"\"\"全屋播放\r\n\r\nplatform=description text\r\nchecksum=description text\r\n了解 MiCast：https://github.com/DyMode/MiCast\r\n\"\"\"\r\nchecksum=old\r\n"
+	got, err := normalizeManifest([]byte(source), "arm", "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.ReplaceAll(source, "\r\n", "\n")
+	want = strings.Replace(want, "platform=x86", "platform=arm", 1)
+	want = strings.Replace(want, "checksum=old\n", "\nchecksum=new\n", 1)
+	if string(got) != want {
+		t.Fatalf("manifest changed unexpectedly:\n%s", got)
+	}
+}
+
+func TestNormalizeRejectsUnterminatedDescription(t *testing.T) {
+	raw, source := fixture(t)
+	if err := os.WriteFile(source, []byte("appname=micast-go\nplatform=x86\ndesc=\"\"\"broken\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(filepath.Dir(raw), "result.fpk")
+	if err := normalize(raw, output, source, "x86"); err == nil {
+		t.Fatal("unterminated description accepted")
+	}
+	if _, err := os.Stat(output); !os.IsNotExist(err) {
+		t.Fatal("bad package published")
+	}
+}

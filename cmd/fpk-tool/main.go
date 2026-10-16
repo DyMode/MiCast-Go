@@ -205,24 +205,10 @@ func normalize(input, output, sourceManifest, platform string) error {
 	if appChecksum == "" {
 		return errors.New("app archive missing")
 	}
-	var normalized strings.Builder
-	for _, line := range strings.Split(strings.ReplaceAll(string(manifest), "\r", ""), "\n") {
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		if key == "checksum" {
-			continue
-		}
-		if key == "platform" {
-			value = platform
-		}
-		normalized.WriteString(key + "=" + value + "\n")
+	b, err := normalizeManifest(manifest, platform, appChecksum)
+	if err != nil {
+		return err
 	}
-	normalized.WriteString("checksum=" + appChecksum + "\n")
-	b := []byte(normalized.String())
 	if err = out.WriteHeader(&tar.Header{Name: "manifest", Mode: 0644, Size: int64(len(b)), Typeflag: tar.TypeReg}); err != nil {
 		return err
 	}
@@ -242,6 +228,40 @@ func normalize(input, output, sourceManifest, platform string) error {
 		return err
 	}
 	return os.Rename(target.Name(), output)
+}
+
+// Preserve multiline values verbatim while updating only top-level generated fields.
+func normalizeManifest(manifest []byte, platform, checksum string) ([]byte, error) {
+	var result strings.Builder
+	multiline := false
+	for _, line := range strings.Split(strings.ReplaceAll(string(manifest), "\r\n", "\n"), "\n") {
+		if multiline {
+			result.WriteString(line + "\n")
+			if strings.Contains(line, `"""`) {
+				multiline = false
+			}
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if ok {
+			switch strings.TrimSpace(key) {
+			case "checksum":
+				continue
+			case "platform":
+				line = "platform=" + platform
+			}
+			value = strings.TrimSpace(value)
+			if strings.HasPrefix(value, `"""`) && !strings.Contains(value[3:], `"""`) {
+				multiline = true
+			}
+		}
+		result.WriteString(line + "\n")
+	}
+	if multiline {
+		return nil, errors.New("unterminated multiline manifest value")
+	}
+	result.WriteString("checksum=" + checksum + "\n")
+	return []byte(result.String()), nil
 }
 func outerReader(file *os.File) (io.Reader, io.Closer, error) {
 	header := make([]byte, 2)
@@ -297,6 +317,9 @@ func validate(filename, platform string) error {
 			}
 			if !utf8.Valid(b) || !strings.Contains(string(b), "appname=micast-go") || !strings.Contains(string(b), "platform="+platform) || strings.Contains(string(b), "install_dep_apps=python") {
 				return errors.New("invalid MiCast Go manifest")
+			}
+			if _, err := normalizeManifest(b, platform, ""); err != nil {
+				return err
 			}
 			for _, line := range strings.Split(string(b), "\n") {
 				key, value, ok := strings.Cut(line, "=")

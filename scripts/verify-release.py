@@ -21,6 +21,11 @@ for platform, arch, machine in [("x86", "amd64", 62), ("arm", "arm64", 183)]:
     assert digest in Path(str(path) + ".sha256").read_text(encoding="utf-8"), "FPK SHA256 mismatch"
     with tarfile.open(fileobj=io.BytesIO(raw)) as outer:
         manifest = outer.extractfile("manifest").read().decode("utf-8")
+        expected_manifest = (ROOT / "packaging/fnos/manifest").read_text(encoding="utf-8")
+        expected_manifest = re.sub(r"(?m)^platform=.+$", "platform=" + platform, expected_manifest)
+        # All reviewed description lines, including multiline delimiters, must survive packaging.
+        packaged_manifest = re.sub(r"(?m)^checksum=.*\n?", "", manifest)
+        assert packaged_manifest.rstrip() == expected_manifest.rstrip(), "Packaged manifest differs from reviewed source"
         assert "version=" + VERSION + "\n" in manifest
         assert "platform=" + platform + "\n" in manifest
         app = outer.extractfile("app.tgz").read()
