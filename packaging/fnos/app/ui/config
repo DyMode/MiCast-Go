@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "micast-go.main": {
+      "title": "MiCast Go",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/micast-go",
+      "gatewaySocket": "app.sock",
+      "url": "/app/micast-go/",
+      "allUsers": true
+    }
+  }
+}

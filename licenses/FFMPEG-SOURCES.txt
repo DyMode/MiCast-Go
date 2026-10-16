@@ -1,0 +1,26 @@
+# MiCast audio runtime sources
+
+The FPK contains a locally built, audio-only FFmpeg 7.1.5 executable with
+LAME 3.100. FFmpeg is configured without GPL/nonfree components and reports
+LGPL version 2.1 or later. It runs as a separate process from the Go service.
+
+Pinned original archives and toolchain checksums:
+`packaging/audio/sources.lock.json`.
+
+- FFmpeg source: https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz
+- LAME source: https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz
+- Zig SDK: https://ziglang.org/download/0.14.1/zig-x86_64-windows-0.14.1.zip
+
+The sources are unmodified; component selection is recorded in
+`scripts/build-audio.sh`. Rebuild instructions are in `packaging/audio/BUILDING.txt`.
+
+Publish `micast-audio-sources-7.1.5.tar.gz` and its SHA-256 file alongside the
+FPKs. This attachment contains the original FFmpeg/LAME archives, pinned
+build scripts, actual per-target configure invocations and generated
+configuration, and linked libc/compiler runtime sources from the pinned
+Zig SDK. Raw logs containing developer environment variables are excluded.
+
+Each FPK carries the LGPLv2.1 text, LAME, musl and Zig notices, and runtime
+BUILD-INFO.json in `licenses/ffmpeg`. The Go application's MIT license does
+not replace any component license. The previous John Van Sickle GPLv3
+binary is no longer used in the release packaging path.

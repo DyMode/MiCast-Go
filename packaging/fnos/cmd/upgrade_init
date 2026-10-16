@@ -1,0 +1,23 @@
+#!/bin/bash
+set -eu
+# Quiesce writes and release streams before replacing files or removing login.
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+if [ -n "${TRIM_APPDEST:-}" ] && [ -f "$script_dir/main" ]; then
+  /bin/bash "$script_dir/main" stop
+fi
+umask 077
+: "${TRIM_PKGVAR:?}"
+case "$TRIM_PKGVAR" in /|'') exit 1 ;; esac
+backup="$TRIM_PKGVAR/upgrade-backup"
+[ ! -L "$backup" ] || exit 1
+mkdir -p -- "$backup"
+chmod 0700 "$backup"
+# Shell copy works when the installed Go binary predates backup flags.
+for name in account.key account.enc access.key admin-password config.json advertise-ip; do
+  source_file="$TRIM_PKGVAR/$name"
+  target_file="$backup/$name"
+  [ ! -L "$source_file" ] || exit 1
+  rm -f -- "$target_file"
+  if [ -f "$source_file" ]; then cp -- "$source_file" "$target_file"; chmod 0600 "$target_file"; fi
+done
+if [ -f "$backup/account.enc" ] && [ ! -f "$backup/account.key" ]; then exit 1; fi

@@ -1,0 +1,5 @@
+# Lucide icons
+
+Source: https://github.com/lucide-icons/lucide/tree/7b0196e249ca09ca27c584c497aca9a8cab8a7f5/icons
+
+Selected icons: mail, heart, file-text, shield-check, log-out, house, power, volume-2, volume-x, chevron-down, pause, play, square. Unmodified path geometry, bundled as SVG symbols. License: lucide.txt.

@@ -1,0 +1,5 @@
+{
+  "defaults": {"run-as": "root"},
+  "username": "micast-go",
+  "groupname": "micast-go"
+}

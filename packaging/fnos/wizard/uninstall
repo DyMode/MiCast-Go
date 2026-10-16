@@ -1,0 +1,35 @@
+[
+  {
+    "stepTitle": "卸载 MiCast Go",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "卸载会停止播放。请选择要保留的数据；删除后无法通过应用恢复。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_data_policy",
+        "label": "应用数据",
+        "initValue": "keep_all",
+        "options": [
+          {
+            "label": "保留全部：登录、音箱和播放设置",
+            "value": "keep_all"
+          },
+          {
+            "label": "删除登录：清除米家凭据和管理密码，保留音箱和播放设置",
+            "value": "remove_login"
+          },
+          {
+            "label": "删除全部：清除登录、音箱、设置、日志、缓存和升级备份",
+            "value": "remove_all"
+          }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "删除范围为 MiCast Go 私有应用目录。浏览器网站数据、系统快照及您另行保存的文件需自行清理。"
+      }
+    ]
+  }
+]

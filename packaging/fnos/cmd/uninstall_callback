@@ -1,0 +1,28 @@
+#!/bin/bash
+set -eu
+case "${TRIM_PKGVAR:-}" in ''|/) exit 1 ;; esac
+# An upgrade without an uninstall choice must never destroy credentials.
+case "${wizard_data_policy:-keep_all}" in
+keep_all) ;;
+remove_login)
+  [ ! -L "$TRIM_PKGVAR/upgrade-backup" ] || exit 1
+  for name in account.enc account.key access.key admin-password; do
+    rm -f -- "$TRIM_PKGVAR/$name" "$TRIM_PKGVAR/upgrade-backup/$name"
+  done
+  ;;
+remove_all)
+  # fnOS may supply a symlink to its private volume directory. Resolve it once,
+  # keep the directory itself, and never follow symlinks inside it.
+  case "$TRIM_PKGVAR" in /*) ;; *) exit 1 ;; esac
+  [ -d "$TRIM_PKGVAR" ] || exit 0
+  data_dir="$(readlink -f -- "$TRIM_PKGVAR")"
+  case "$data_dir" in /|'') exit 1 ;; esac
+  case "${data_dir#/}" in */*) ;; *) exit 1 ;; esac
+  if [ -n "${TRIM_APPDEST:-}" ]; then
+    app_dir="$(readlink -f -- "$TRIM_APPDEST")"
+    case "$app_dir" in "$data_dir"|"$data_dir"/*) exit 1 ;; esac
+  fi
+  find "$data_dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  ;;
+*) exit 1 ;;
+esac

@@ -1,0 +1,47 @@
+# 自编译音频运行时
+
+MiCast Go 使用 FFmpeg 7.1.5、LAME 3.100 和 Zig 0.14.1 构建静态音频程序。下载地址、版本和 SHA-256 固定在 `packaging/audio/sources.lock.json`。FFmpeg 和 LAME 上游源码不作修改；启用范围由 `scripts/build-audio.sh` 的参数控制。
+
+## 功能范围
+
+| 用途 | 范围 |
+| --- | --- |
+| 输入 | MP3、AAC/ADTS、M4A/AAC、M4A/ALAC、FLAC、WAV 常见 PCM/浮点编码、Ogg/Opus、Ogg/Vorbis、原始 s16le PCM |
+| 输出 | MP3、FLAC、WAV、原始 s16le PCM（服务对外为 PCM 添加 WAV 容器） |
+| 处理 | 采样率转换、声道转换、音频格式转换和定位 |
+| 取文件 | file、pipe；HTTP 媒体由 Go 服务先下载，不经过 FFmpeg 网络协议 |
+
+关闭视频编解码、设备采集、网络输入、FFplay、FFprobe、外部自动依赖检测、GPL 与 nonfree 功能。CLI 自带的少量基础过滤器仍会被 FFmpeg 选入，但没有启用视频编码器。
+
+## 构建
+
+开发机使用 Windows、Python 3.12+、Git Bash 和支持 zstd 的 tar。SDK 和源码下载到项目 `.tools/audio-build/`，不安装全局工具，也不修改系统服务。
+
+回归测试另需完整参考 FFmpeg 生成输入样本，可通过 `--reference` 指定；参考程序不随应用分发。源码附件可独立重建音频运行时，FPK 打包步骤在主项目源码中执行。
+
+```powershell
+python scripts/build-audio.py --clean
+python scripts/build-audio.py --target windows-amd64 --clean
+python scripts/check-audio-runtime.py
+python scripts/package-audio.py
+./scripts/build-fnos.ps1
+python scripts/verify-release.py
+```
+
+本机回归版本使用相同编解码组件；Windows 单独保留 `debug=0` 配置，以避开上游针对 GNU ld 的 MinGW 链接参数。两种 Linux 使用 musl 静态链接，检查 ELF 架构及无动态解释器/共享库依赖。
+
+重新构建时使用 `--clean` 清理选定架构的私有构建目录。仅需要准备下载时使用 `--prepare-only`。`--jobs` 控制并行数量。
+
+## 发布附件
+
+- 两个精简运行时压缩包及摘要：`dist/audio/ffmpeg-7.1.5-micast-{amd64,arm64}.tar.gz`。
+- 对应源码和构建附件：`dist/audio/micast-audio-sources-7.1.5.tar.gz`，打包 FPK 时复制到 `dist/fnos/`。
+- FPK 内携带 FFmpeg LGPLv2.1、LAME、musl、Zig 许可及构建信息。
+
+源码附件包含原始 FFmpeg/LAME 源码包、下载校验表、构建/验证脚本、每个架构的实际 configure 命令、生成配置以及随 Zig 提供的 musl/compiler runtime 源码。完整固定版本的 Zig SDK 由构建脚本下载；源码附件不含开发机的原始环境变量日志。公开发布时，源码附件和它的校验文件应与 FPK 一同提供。
+
+运行时为 LGPL-2.1-or-later，LAME 和 libc/compiler runtime 保留各自许可；Go 服务独立通过管道运行 FFmpeg。具体许可文本随包保存。
+
+## 验证边界
+
+`check-audio-runtime.py` 在 Windows 执行同配置本机程序，检查八类输入、四类输出、重采样及三个目标的功能集合一致性；无损输入输出逐字节比较。Linux ELF 结构检查不等于 Linux 真机执行，NAS x86/ARM 的实际取流和播放仍需验收。没有声明不同机器或构建路径会生成逐字节相同的程序。

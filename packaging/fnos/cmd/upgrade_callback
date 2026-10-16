@@ -1,0 +1,14 @@
+#!/bin/bash
+set -eu
+umask 077
+for directory in "${TRIM_APPDEST:-}" "${TRIM_PKGVAR:-}"; do
+  case "$directory" in ''|/) exit 1 ;; esac
+done
+: "${TRIM_APPDEST:?}"
+: "${TRIM_PKGVAR:?}"
+: "${TRIM_USERNAME:?}"
+chmod 0755 "$TRIM_APPDEST/bin/micast-go" "$TRIM_APPDEST/audio/ffmpeg"
+"$TRIM_APPDEST/bin/micast-go" --data-dir "$TRIM_PKGVAR" --restore-upgrade
+chown -R -H "$TRIM_USERNAME" "$TRIM_PKGVAR"
+chown "$TRIM_USERNAME" "$TRIM_APPDEST"
+chmod 0700 "$TRIM_PKGVAR"

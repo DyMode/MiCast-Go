@@ -1,0 +1,8 @@
+#!/bin/bash
+set -eu
+# Quiesce writes and release streams before replacing files or removing login.
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+if [ -n "${TRIM_APPDEST:-}" ] && [ -f "$script_dir/main" ]; then
+  /bin/bash "$script_dir/main" stop
+fi
+exit 0

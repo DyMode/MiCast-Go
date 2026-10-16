@@ -1,0 +1,12 @@
+# Synthetic ALAC fixture
+
+This fixture contains 4,096 stereo samples at 44.1 kHz / 16-bit, synthesized
+from 440 Hz and 660 Hz sine waves and losslessly encoded by development FFmpeg.
+It contains no user recording, account data, or third-party music.
+
+- `sine.alac`: one compressed ALAC packet.
+- `sine.s16le`: the original interleaved PCM, checked byte-for-byte.
+- `sine.fmtp`: RTP payload type plus ALACSpecificConfig fields.
+
+Used to verify the real compressed packet decoder and RTSP configuration path,
+in addition to the uncompressed ALAC escape-frame test.

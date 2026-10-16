@@ -1,0 +1,35 @@
+{
+  "ffmpeg": "7.1.5",
+  "lame": "3.100",
+  "zig": "0.14.1",
+  "downloads": [
+    {
+      "name": "zig.zip",
+      "url": "https://ziglang.org/download/0.14.1/zig-x86_64-windows-0.14.1.zip",
+      "sha256": "554f5378228923ffd558eac35e21af020c73789d87afeabf4bfd16f2e6feed2c",
+      "bytes": 82229343,
+      "directory": "zig-x86_64-windows-0.14.1"
+    },
+    {
+      "name": "make.pkg.tar.zst",
+      "url": "https://repo.msys2.org/msys/x86_64/make-4.4.1-2-x86_64.pkg.tar.zst",
+      "sha256": "2408af61717dae87b00c855b132769a125c708907fc94a46bb16dae076113e5c",
+      "bytes": 519783,
+      "directory": "make"
+    },
+    {
+      "name": "ffmpeg-7.1.5.tar.xz",
+      "url": "https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz",
+      "sha256": "de668509caf9e35e3cd162473441fdb29538c6d96ed080292b3cf9e6fc5d558f",
+      "bytes": 11050340,
+      "directory": "ffmpeg-7.1.5"
+    },
+    {
+      "name": "lame-3.100.tar.gz",
+      "url": "https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz",
+      "sha256": "ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e",
+      "bytes": 1524133,
+      "directory": "lame-3.100"
+    }
+  ]
+}

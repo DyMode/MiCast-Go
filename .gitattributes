@@ -1,0 +1,10 @@
+* text=auto
+*.go text eol=lf
+*.sh text eol=lf
+packaging/fnos/cmd/* text eol=lf
+*.svg text eol=lf
+*.png binary
+*.alac binary
+*.s16le binary
+# Preserve upstream license text verbatim, including its whitespace.
+licenses/** -whitespace

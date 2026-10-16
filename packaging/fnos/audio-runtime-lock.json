@@ -1,0 +1,28 @@
+[
+  {
+    "arch": "amd64",
+    "version": "7.1.5",
+    "archive_file": "ffmpeg-7.1.5-micast-amd64.tar.gz",
+    "runtime_dir": "ffmpeg-7.1.5-micast-amd64",
+    "archive_sha256": "ad23e1e070acbd093ae7fafae0334e805ecbd0e2b2c324f2df5f34ee849505d1",
+    "binary_sha256": "45a147fb2dcdb7a7d27ee03fd30303232d9c3633ea6863e4526223ed3f6cf5d6",
+    "binary_bytes": 2485464,
+    "license_file": "LICENSE.txt",
+    "local": true,
+    "source_archive": "micast-audio-sources-7.1.5.tar.gz",
+    "source_sha256": "9a3971e0ec6652498b7295f5068c0fb612ed1c0075403af580e3ef1eb02810f0"
+  },
+  {
+    "arch": "arm64",
+    "version": "7.1.5",
+    "archive_file": "ffmpeg-7.1.5-micast-arm64.tar.gz",
+    "runtime_dir": "ffmpeg-7.1.5-micast-arm64",
+    "archive_sha256": "250043f9b5ae6bb8afe951406c54392782bf89b1c67db72722b97a651e214123",
+    "binary_sha256": "655d6aabcc4544fae49f3ee512580b3a0e0b623123e1f2a558453ecfc423b5ce",
+    "binary_bytes": 2373320,
+    "license_file": "LICENSE.txt",
+    "local": true,
+    "source_archive": "micast-audio-sources-7.1.5.tar.gz",
+    "source_sha256": "9a3971e0ec6652498b7295f5068c0fb612ed1c0075403af580e3ef1eb02810f0"
+  }
+]

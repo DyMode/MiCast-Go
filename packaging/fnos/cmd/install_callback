@@ -1,0 +1,14 @@
+#!/bin/bash
+set -eu
+umask 077
+for directory in "${TRIM_APPDEST:-}" "${TRIM_PKGVAR:-}"; do
+  case "$directory" in ''|/) exit 1 ;; esac
+done
+: "${TRIM_APPDEST:?}"
+: "${TRIM_PKGVAR:?}"
+: "${TRIM_USERNAME:?}"
+mkdir -p -- "$TRIM_PKGVAR"
+chmod 0755 "$TRIM_APPDEST/bin/micast-go" "$TRIM_APPDEST/audio/ffmpeg"
+# Existing passwords and Xiaomi credentials are retained on reinstall.
+chown -R -H "$TRIM_USERNAME" "$TRIM_PKGVAR"
+chmod 0700 "$TRIM_PKGVAR"

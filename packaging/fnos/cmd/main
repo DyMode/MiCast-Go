@@ -1,0 +1,79 @@
+#!/bin/bash
+set -eu
+umask 077
+for directory in "${TRIM_APPDEST:-}" "${TRIM_PKGVAR:-}"; do
+  case "$directory" in ''|/) exit 1 ;; esac
+done
+: "${TRIM_APPDEST:?missing application directory}"
+: "${TRIM_PKGVAR:?missing application data directory}"
+PID_FILE="$TRIM_PKGVAR/micast-go.pid"
+SOCKET_FILE="$TRIM_APPDEST/app.sock"
+BINARY="$TRIM_APPDEST/bin/micast-go"
+LOG_FILE="$TRIM_PKGVAR/micast-go.log"
+
+is_running() {
+  [ -s "$PID_FILE" ] || return 1
+  pid="$(cat "$PID_FILE")"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)" || return 1
+  exe="${exe% (deleted)}"
+  [ "$exe" = "$(readlink -f "$BINARY")" ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+healthy() {
+  [ -S "$SOCKET_FILE" ] && curl -fsS --max-time 2 --unix-socket "$SOCKET_FILE" http://localhost/healthz >/dev/null 2>&1
+}
+
+stop_service() {
+  if is_running; then
+    kill "$pid" 2>/dev/null || true
+    for ((i=0; i<200; i++)); do is_running || break; sleep 0.1; done
+    if is_running; then
+      kill -9 "$pid" 2>/dev/null || return 1
+      for ((i=0; i<20; i++)); do is_running || break; sleep 0.1; done
+      is_running && return 1
+    fi
+  fi
+  if healthy; then
+    echo "服务仍在运行，无法安全清理 PID 和 Socket。" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+    return 1
+  fi
+  rm -f -- "$PID_FILE"
+  [ ! -S "$SOCKET_FILE" ] || rm -f -- "$SOCKET_FILE"
+}
+
+start_service() {
+  if is_running; then healthy; return $?; fi
+  : "${TRIM_USERNAME:?missing service user}"
+  mkdir -p -- "$TRIM_PKGVAR"
+  chmod 0755 "$BINARY" "$TRIM_APPDEST/audio/ffmpeg" || return 1
+  chown "$TRIM_USERNAME" "$TRIM_PKGVAR" "$TRIM_APPDEST" || return 1
+  chmod 0700 "$TRIM_PKGVAR"
+  if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -ge 5242880 ]; then mv -f -- "$LOG_FILE" "$LOG_FILE.1"; fi
+  args=(--listen 0.0.0.0:42310 --airplay-listen 0.0.0.0:42510 --data-dir "$TRIM_PKGVAR" --ffmpeg "$TRIM_APPDEST/audio/ffmpeg" --gateway-socket "$SOCKET_FILE" --pid-file "$PID_FILE")
+  if [ -s "$TRIM_PKGVAR/advertise-ip" ]; then args+=(--advertise-ip "$(cat "$TRIM_PKGVAR/advertise-ip")"); fi
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup runuser -u "$TRIM_USERNAME" -- "$BINARY" "${args[@]}" >>"$LOG_FILE" 2>&1 9>&- &
+  else
+    nohup runuser -u "$TRIM_USERNAME" -- "$BINARY" "${args[@]}" >>"$LOG_FILE" 2>&1 9>&- &
+  fi
+  launcher=$!
+  for ((i=0; i<250; i++)); do
+    if healthy; then return 0; fi
+    kill -0 "$launcher" 2>/dev/null || break
+    sleep 0.1
+  done
+  echo "MiCast Go 启动失败。业务端口会自动避让，请查看 $LOG_FILE" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+  stop_service
+  return 1
+}
+
+mkdir -p -- "$TRIM_PKGVAR"
+if command -v flock >/dev/null 2>&1; then exec 9>"$TRIM_PKGVAR/service.lock"; flock -w 35 9 || exit 1; fi
+case "${1:-}" in
+  start) start_service ;;
+  stop) stop_service ;;
+  status) is_running && healthy && exit 0; exit 3 ;;
+  *) exit 1 ;;
+esac

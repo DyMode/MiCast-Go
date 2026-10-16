@@ -1,0 +1,6 @@
+.tools/
+data/
+dist/
+.run/
+build/
+*.log
