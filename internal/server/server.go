@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,7 @@ type Server struct {
 	mux           *http.ServeMux
 	engine        *playback.Engine
 	passwordHash  string
+	dataDir       string
 }
 type Options struct {
 	Access *AccessControl
@@ -40,6 +42,7 @@ type Options struct {
 	TrustedGateway bool
 	Engine         *playback.Engine
 	PasswordHash   string
+	DataDir        string
 }
 
 func New(a *app.App, key []byte, options ...Options) http.Handler {
@@ -49,6 +52,7 @@ func New(a *app.App, key []byte, options ...Options) http.Handler {
 		s.routes = options[0].Routes
 		s.engine = options[0].Engine
 		s.passwordHash = options[0].PasswordHash
+		s.dataDir = options[0].DataDir
 	}
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	s.mux.HandleFunc("POST /api/access", s.access)
@@ -92,6 +96,8 @@ func New(a *app.App, key []byte, options ...Options) http.Handler {
 		respond(w, err)
 	})))
 	s.mux.Handle("PATCH /api/devices/{id}", s.authorize(http.HandlerFunc(s.speaker)))
+	s.mux.Handle("GET /api/diagnostics", s.authorize(http.HandlerFunc(s.diagnostics)))
+	s.mux.Handle("POST /api/diagnostics/export", s.authorize(http.HandlerFunc(s.exportDiagnostics)))
 	s.mux.Handle("PUT /api/settings", s.authorize(http.HandlerFunc(s.settings)))
 	s.mux.Handle("POST /api/control", s.authorize(http.HandlerFunc(s.control)))
 	s.mux.Handle("GET /api/routes", s.authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -271,10 +277,12 @@ func (s *Server) speaker(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	var p struct {
-		Mode     string `json:"mode"`
-		Selected string `json:"selected"`
-		Name     string `json:"name"`
-		Format   string `json:"format"`
+		Mode       string           `json:"mode"`
+		Selected   string           `json:"selected"`
+		Name       string           `json:"name"`
+		Format     string           `json:"format"`
+		VolumeMode string           `json:"volume_mode"`
+		Equalizer  *store.Equalizer `json:"equalizer"`
 	}
 	if err := decode(w, r, &p); err != nil {
 		respond(w, err)
@@ -287,7 +295,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	if p.Mode == "" {
 		p.Mode = "whole_house"
 	}
-	err := s.app.UpdateSettings(r.Context(), p.Mode, p.Selected, p.Name, p.Format)
+	err := s.app.UpdateSettings(r.Context(), p.Mode, p.Selected, p.Name, p.Format, app.SettingsOptions{VolumeMode: p.VolumeMode, Equalizer: p.Equalizer})
 	if s.routes != nil {
 		_ = s.routes.Sync()
 	}
@@ -335,7 +343,8 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 		var err error
 		switch p.Action {
 		case "play_url":
-			_, err = engine.PlayMedia(p.URL, playback.Track{}, 0)
+			seq := engine.Sequence()
+			_, err = engine.StartFile(playback.StartRequest{Seq: seq, Protocol: "web", TrackID: "web-" + strconv.FormatUint(seq, 10), URI: p.URL, Continuation: false})
 		case "pause":
 			err = engine.Pause(r.Context())
 		case "play":

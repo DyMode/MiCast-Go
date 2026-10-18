@@ -117,7 +117,7 @@ func run() error {
 		listener.Close()
 		return err
 	}
-	management := server.New(application, key, server.Options{Routes: routes, Access: access})
+	management := server.New(application, key, server.Options{Routes: routes, Access: access, DataDir: abs})
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if routes != nil && (strings.HasPrefix(r.URL.Path, "/stream/") || strings.HasPrefix(r.URL.Path, "/dlna/") || strings.HasPrefix(r.URL.Path, "/receivers/")) {
 			routes.ServeHTTP(w, r)
@@ -135,7 +135,7 @@ func run() error {
 			return err
 		}
 		defer os.Remove(*uds)
-		gateway = &http.Server{Handler: gatewayHandler(server.New(application, key, server.Options{Routes: routes, Access: access, TrustedGateway: true})), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 40 * time.Second, IdleTimeout: 60 * time.Second, BaseContext: func(net.Listener) context.Context { return ctx }}
+		gateway = &http.Server{Handler: gatewayHandler(server.New(application, key, server.Options{Routes: routes, Access: access, TrustedGateway: true, DataDir: abs})), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 40 * time.Second, IdleTimeout: 60 * time.Second, BaseContext: func(net.Listener) context.Context { return ctx }}
 		go func() {
 			if err := gateway.Serve(socket); err != nil && err != http.ErrServerClosed {
 				slog.Error("网关已停止", "error", err)

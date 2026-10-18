@@ -47,8 +47,35 @@ html,body{scrollbar-width:none}html::-webkit-scrollbar,body::-webkit-scrollbar{d
 .account-bar .account-exit{background:transparent;border-color:transparent;color:var(--muted)}
 .account-bar .account-exit:hover{background:var(--control-bg);color:var(--control-fg)}
 
+/* Keep the hover fill rounded inside auxiliary action panels. */
+.support-footer button.quiet:hover,.support-footer button.text-button:hover,
+.support-footer button.quiet:active,.support-footer button.text-button:active{border-radius:6px}
 /* Auxiliary actions use the same disclosure/list pattern as settings. */
 main{padding-bottom:calc(28px + env(safe-area-inset-bottom,0px));padding-left:max(20px,env(safe-area-inset-left,0px));padding-right:max(20px,env(safe-area-inset-right,0px))}
 .support-footer{margin-top:12px}.support-footer .panel{overflow:hidden}.support-list{padding:0 14px 4px}.support-actions,.support-legal{display:contents}.support-footer button.quiet,.support-footer button.text-button{display:flex;align-items:center;gap:10px;width:100%;min-height:44px;padding:10px 2px;border:0;border-top:1px solid var(--line);border-radius:0;background:transparent;color:#35585c;text-align:left;font-size:12px;font-weight:500}.support-footer button::after{content:"";width:6px;height:6px;margin-left:auto;margin-right:5px;border-top:1.5px solid #7b8a8c;border-right:1.5px solid #7b8a8c;transform:rotate(45deg)}.support-footer button:hover,.support-footer button:active{background:var(--control-bg);filter:none}.support-footer .ui-icon{width:17px;height:17px;flex-shrink:0;stroke-width:1.8;color:#527275}.support-footer button:focus-visible{outline-offset:-2px}@media(max-width:700px){main{padding-left:max(10px,env(safe-area-inset-left,0px));padding-right:max(10px,env(safe-area-inset-right,0px));padding-bottom:calc(32px + env(safe-area-inset-bottom,0px))}.support-footer{margin-top:10px}}
 
-#support-dialog{color:inherit;border:1px solid var(--line);border-radius:12px;padding:18px;width:min(640px,calc(100% - 24px));max-height:85dvh;overflow:auto}#support-dialog::backdrop{background:rgb(25 45 47 / .35)}#support-dialog header{justify-content:space-between;position:sticky;top:-18px;background:white;padding:8px 0;z-index:1}#support-body{font-size:13px;line-height:1.8;overflow-wrap:anywhere}#support-body>a{display:block;margin:8px 0;color:var(--accent)}.legal-text{white-space:pre-wrap}.support-channels{display:grid;grid-template-columns:1fr 1fr;gap:16px}.support-channels figure{margin:0;min-width:0;text-align:center}.support-channels img{width:100%;height:auto;display:block;border-radius:6px}.support-channels figcaption{margin-bottom:8px}@media(max-width:480px){.support-channels{grid-template-columns:1fr;max-width:240px;margin:auto}}
+#support-dialog{color:inherit;border:1px solid var(--line);border-radius:12px;padding:18px;width:min(640px,calc(100% - 24px));max-height:85dvh;overflow:auto}#support-dialog::backdrop{background:rgb(25 45 47 / .35)}#support-dialog header{justify-content:space-between;position:sticky;top:-18px;background:white;padding:8px 0;z-index:1}#support-body{font-size:13px;line-height:1.8;overflow-wrap:anywhere}#support-body>a{display:block;margin:8px 0;color:var(--accent)}.legal-text{white-space:pre-wrap}.support-channels{display:grid;grid-template-columns:1fr 1fr;gap:16px}.support-channels figure{margin:0;min-width:0;text-align:center}.support-channels img{width:100%;height:auto;display:block;border-radius:6px}.support-channels figcaption{margin-bottom:8px}@media(max-width:480px){.support-channels{grid-template-columns:1fr;max-width:240px;margin:auto}}.settings-actions{grid-column:1/-1;display:flex;justify-content:flex-end}.settings-actions button{min-width:88px}
+
+/* Settings follow one reading order and share one save action. */
+#settings-form{grid-template-columns:minmax(0,1fr) minmax(100px,.45fr);gap:16px 12px;padding:4px 14px 14px;align-items:start}
+.settings-section-title{grid-column:1/-1;font-size:12px;font-weight:600;color:#35585c}
+.volume-mode-field{grid-column:1/-1}
+#access-settings{grid-column:1/-1;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:16px 0 0!important}
+#access-settings>label{display:grid;gap:6px;line-height:18px}
+#access-settings>label>input,#access-settings>label>select{margin:0}
+#access-settings>label:has(#require-login){grid-column:1/-1}
+
+#settings-form .settings-actions{border-top:1px solid var(--line);padding-top:14px}
+#settings-form .settings-actions button{min-height:36px;min-width:112px}
+@media(max-width:700px){#access-settings{grid-template-columns:minmax(0,1fr)}#settings-form .settings-actions button{width:100%;min-height:40px}}
+
+/* Compact field dimensions shared by login, playback, speaker options and settings. */
+:root{--field-height:30px}
+input:not([type="checkbox"]):not([type="range"]),select{height:var(--field-height);min-height:var(--field-height);padding:3px 8px;line-height:20px;border-radius:5px}
+select{padding-right:24px}
+#settings-form{gap:12px 10px}
+#access-settings{gap:10px;padding-top:12px!important}
+.panel form>label:not(.member-check),.field,#access-settings>label{gap:4px}
+.settings-actions{grid-column:1/-1;display:flex;justify-content:flex-end}
+#settings-form .settings-actions{padding-top:12px}
+@media(max-width:700px),(pointer:coarse){:root{--field-height:32px}input:not([type="checkbox"]):not([type="range"]),select{font-size:16px}.route-options select{width:96px}.route-options input{width:76px}}
