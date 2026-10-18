@@ -1,6 +1,7 @@
 package dlna
 
 import (
+	"context"
 	"net"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,76 @@ import (
 
 	"micastgo/internal/playback"
 )
+
+func TestStopRevokesQueueAndAllowsControllerReplacement(t *testing.T) {
+	s := testRenderer(t)
+	s.uri = "http://192.168.1.20/first.mp3"
+	s.nextURI, s.nextMetadata = "http://192.168.1.20/stale.mp3", "stale"
+	if w := soap(t, s, "AVTransport", "Stop", ""); w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	if s.nextURI != "" || s.nextMetadata != "" || s.uri == "" {
+		t.Fatal("stop must revoke continuation while preserving explicit replay")
+	}
+	// A controller that waits for STOPPED can provide the next current URI
+	// later, without having used SetNextAVTransportURI or a subscription.
+	w := soap(t, s, "AVTransport", "SetAVTransportURI", `<CurrentURI>http://192.168.1.20/later.mp3</CurrentURI>`)
+	if w.Code != 200 || s.uri != "http://192.168.1.20/later.mp3" {
+		t.Fatal(w.Body.String())
+	}
+	if w = soap(t, s, "AVTransport", "Next", ""); w.Code != 500 {
+		t.Fatal("stopped queue was resurrected")
+	}
+}
+
+func TestTransportLifecycleMapping(t *testing.T) {
+	s := &Server{owner: "current"}
+	for _, tc := range []struct{ state, want string }{
+		{"transitioning", "TRANSITIONING"}, {"waiting_for_speakers", "TRANSITIONING"},
+		{"playing", "PLAYING"}, {"paused", "PAUSED_PLAYBACK"},
+		{"stopped", "STOPPED"}, {"error", "STOPPED"},
+	} {
+		status := playback.Status{SessionID: "current", Protocol: "dlna", State: tc.state}
+		if got := s.transportState(status); got != tc.want {
+			t.Fatalf("%s: %s, want %s", tc.state, got, tc.want)
+		}
+		status.Protocol = "airplay"
+		if s.transportState(status) != "STOPPED" {
+			t.Fatal("AirPlay leaked into DLNA transport")
+		}
+	}
+}
+
+func TestWebResumeAndSeekRetainDLNATransportOwnership(t *testing.T) {
+	s := testRenderer(t)
+	// This source is rejected locally; no external network is required to
+	// verify the control identity used by the web and DLNA entry points.
+	raw := "http://127.0.0.1:1/track.wav"
+	id, err := s.engine.PlayMedia(raw, playback.Track{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.owner, s.uri = id, raw
+	s.mu.Unlock()
+	if err := s.engine.Resume(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.engine.Seek(3); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	owner := s.owner
+	s.mu.Unlock()
+	if status := s.engine.Status(); owner != status.SessionID {
+		t.Fatal("web transport commands detached DLNA ownership", owner, status)
+	}
+	// A protocol Stop must still address the resumed media generation.
+	w := soap(t, s, "AVTransport", "Stop", "")
+	if w.Code != 200 || s.engine.Status().State != "stopped" {
+		t.Fatal("DLNA could not stop the resumed cast", w.Body.String())
+	}
+}
 
 func TestMiCastQueueAndEmptyURICompatibility(t *testing.T) {
 	s := testRenderer(t)
@@ -29,10 +100,25 @@ func TestMiCastQueueAndEmptyURICompatibility(t *testing.T) {
 		t.Fatal("empty URI erased transport/queue")
 	}
 	// A local-only rejected download allows testing session creation without LAN traffic.
+	s.stateMu.Lock()
 	s.nextURI = "http://127.0.0.1:1/next.mp3"
+	s.stateMu.Unlock()
 	w = soap(t, s, "AVTransport", "Next", "")
-	if w.Code != 200 || s.nextURI != "" || s.owner == "" || s.track.Title != "下一首" {
+	if w.Code != 200 {
 		t.Fatal(w.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.stateMu.Lock()
+		owner, next, title := s.owner, s.nextURI, s.track.Title
+		s.stateMu.Unlock()
+		if next == "" && owner != "" && title == "下一首" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Next did not start the queued track", owner, next, title)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	w = soap(t, s, "AVTransport", "SetNextAVTransportURI", `<NextURI>http://192.168.1.20/another.mp3</NextURI>`)
 	if w.Code != 200 {
@@ -55,8 +141,8 @@ func TestAutomaticNextIsLimitedToFinishedDLNASession(t *testing.T) {
 		}
 	}
 	s.advanceLocked(playback.Status{Finished: true, SessionID: "finished", Protocol: "dlna"})
-	if s.owner == "finished" || s.nextURI != "" {
-		t.Fatal("finished DLNA session did not advance")
+	if s.owner != "finished" || s.nextURI == "" {
+		t.Fatal("unverified completion advanced the engine's current session")
 	}
 }
 
@@ -141,11 +227,48 @@ func TestVolumeWhileMutedDoesNotUnmute(t *testing.T) {
 			t.Fatal(w.Body.String())
 		}
 	}
-	if !s.muted || s.volume != 23 || s.beforeMute != 23 {
+	volume, muted := s.engine.VolumeState()
+	if !muted || volume != 23 {
 		t.Fatal("SetVolume cleared mute or lost requested restore volume")
 	}
 	w := soap(t, s, "RenderingControl", "SetMute", `<DesiredMute>0</DesiredMute>`)
-	if w.Code != 200 || s.muted || s.volume != 23 {
+	volume, muted = s.engine.VolumeState()
+	if w.Code != 200 || muted || volume != 23 {
 		t.Fatal("unmute did not restore requested volume")
+	}
+}
+
+func TestTerminalEngineStopClearsQueueButStaleStopDoesNot(t *testing.T) {
+	s := testRenderer(t)
+	s.owner = "current"
+	s.nextURI = "http://media/next"
+	s.advanceLocked(playback.Status{SessionID: "old", Protocol: "dlna", EndReason: "stopped"})
+	if s.nextURI == "" {
+		t.Fatal("stale stop cleared current queue")
+	}
+	s.advanceLocked(playback.Status{SessionID: "current", Protocol: "dlna", EndReason: "stopped"})
+	if s.nextURI != "" {
+		t.Fatal("engine stop retained queued continuation")
+	}
+}
+
+func TestOriginalRendererPositionCountersAndServiceContract(t *testing.T) {
+	s := testRenderer(t)
+	w := soap(t, s, "AVTransport", "GetPositionInfo", "")
+	for _, field := range []string{"<RelCount>0</RelCount>", "<AbsCount>0</AbsCount>"} {
+		if !strings.Contains(w.Body.String(), field) {
+			t.Fatal("position differs from the reference contract", w.Body.String())
+		}
+	}
+	for _, value := range []string{"STOPPED", "PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING", "NO_MEDIA_PRESENT", "OK", "ERROR_OCCURRED", "REL_TIME"} {
+		if !strings.Contains(scpd("AVTransport"), "<allowedValue>"+value+"</allowedValue>") {
+			t.Fatal("reference state declaration missing", value)
+		}
+	}
+	if !strings.Contains(scpd("AVTransport"), "<name>AVTransportURI</name><dataType>uri</dataType>") {
+		t.Fatal("URI type differs from original")
+	}
+	if !strings.Contains(scpd("RenderingControl"), "<allowedValue>Master</allowedValue>") {
+		t.Fatal("Master channel declaration missing")
 	}
 }

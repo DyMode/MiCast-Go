@@ -208,3 +208,29 @@ func TestLogoutWithdrawsUnusableReceivers(t *testing.T) {
 }
 
 func boolPointer(v bool) *bool { return &v }
+
+func TestRenamePreservesEngineAndDoesNotCommandSpeaker(t *testing.T) {
+	m, cloud, _, _ := newManager(t)
+	before, _ := m.Engine("whole_house")
+	config := m.app.Config()
+	if err := m.app.UpdateSettings(context.Background(), config.Mode, config.Selected, "Renamed", config.Format); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := m.Engine("whole_house")
+	if before != after {
+		t.Fatal("rename replaced playback engine")
+	}
+	select {
+	case p := <-cloud.Plays:
+		t.Fatal("idle rename commanded playback", p)
+	default:
+	}
+	for _, status := range m.Status() {
+		if status.ID == "whole_house" && status.Name != "Renamed" {
+			t.Fatal("discovery name not updated")
+		}
+	}
+}

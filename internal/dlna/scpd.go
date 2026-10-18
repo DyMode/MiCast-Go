@@ -2,6 +2,7 @@ package dlna
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -35,7 +36,13 @@ func scpd(service string) string {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0"?><scpd xmlns="urn:schemas-upnp-org:service-1-0"><specVersion><major>1</major><minor>0</minor></specVersion><actionList>`)
 	vars := map[string]bool{}
-	for action, args := range actions[service] {
+	names := make([]string, 0, len(actions[service]))
+	for name := range actions[service] {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, action := range names {
+		args := actions[service][action]
 		fmt.Fprintf(&b, "<action><name>%s</name><argumentList>", action)
 		for _, arg := range args {
 			p := strings.Split(arg, ":")
@@ -45,8 +52,16 @@ func scpd(service string) string {
 		b.WriteString("</argumentList></action>")
 	}
 	b.WriteString("</actionList><serviceStateTable>")
+	variables := make([]string, 0, len(vars))
 	for name := range vars {
+		variables = append(variables, name)
+	}
+	sort.Strings(variables)
+	for _, name := range variables {
 		kind := "string"
+		if name == "AVTransportURI" || name == "NextAVTransportURI" || name == "CurrentTrackURI" {
+			kind = "uri"
+		}
 		if name == "A_ARG_TYPE_InstanceID" || name == "CurrentTrack" || name == "NumberOfTracks" {
 			kind = "ui4"
 		}
@@ -64,6 +79,20 @@ func scpd(service string) string {
 			events = "yes"
 		}
 		fmt.Fprintf(&b, `<stateVariable sendEvents="%s"><name>%s</name><dataType>%s</dataType>`, events, name, kind)
+		allowed := map[string][]string{
+			"TransportState":  {"STOPPED", "PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING", "NO_MEDIA_PRESENT"},
+			"TransportStatus": {"OK", "ERROR_OCCURRED"}, "TransportPlaySpeed": {"1"},
+			"A_ARG_TYPE_SeekMode": {"REL_TIME"}, "A_ARG_TYPE_Channel": {"Master"},
+			"PlaybackStorageMedium": {"NETWORK", "NOT_IMPLEMENTED"}, "RecordStorageMedium": {"NOT_IMPLEMENTED"}, "RecordMediumWriteStatus": {"NOT_IMPLEMENTED"},
+			"A_ARG_TYPE_Direction": {"Input", "Output"}, "A_ARG_TYPE_ConnectionStatus": {"OK", "ContentFormatMismatch", "InsufficientBandwidth", "UnreliableChannel", "Unknown"},
+		}
+		if values := allowed[name]; len(values) > 0 {
+			b.WriteString("<allowedValueList>")
+			for _, value := range values {
+				fmt.Fprintf(&b, "<allowedValue>%s</allowedValue>", value)
+			}
+			b.WriteString("</allowedValueList>")
+		}
 		if name == "Volume" {
 			b.WriteString("<allowedValueRange><minimum>0</minimum><maximum>100</maximum><step>1</step></allowedValueRange>")
 		}

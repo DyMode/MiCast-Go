@@ -10,7 +10,7 @@ const bridgeGap = 150 * time.Millisecond
 // Caller holds s.mu. Decoded look-ahead is buffered audio, not played position.
 func (s *session) positionAt(now time.Time) float64 {
 	seconds := float64(s.frames) / 44100
-	if s.protocol == "dlna" {
+	if s.mode == fileSource {
 		if s.playbackStart.IsZero() {
 			return s.position
 		}

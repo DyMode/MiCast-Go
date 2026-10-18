@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,6 +30,7 @@ type Track struct {
 	Duration float64 `json:"duration"`
 }
 type Pull struct {
+	Health       string    `json:"health,omitempty"`
 	Bridges      uint64    `json:"bridges"`
 	BufferedMS   int       `json:"buffered_ms"`
 	HistorySkips uint64    `json:"history_skips"`
@@ -36,12 +38,20 @@ type Pull struct {
 	Connections  int       `json:"connections"`
 	Bytes        int64     `json:"bytes"`
 	LastRead     time.Time `json:"last_read"`
+	Completed    bool      `json:"completed"`
 }
 type Status struct {
+	Activity             string          `json:"activity"`
+	Equalizer            store.Equalizer `json:"equalizer"`
+	Clipped              uint64          `json:"clipped_samples"`
+	Events               []Event         `json:"events,omitempty"`
+	VolumeMode           string          `json:"volume_mode"`
 	InputDroppedBytes    int64           `json:"input_dropped_bytes"`
 	EncodingDroppedBytes int64           `json:"encoding_dropped_bytes"`
 	Finished             bool            `json:"finished"`
 	SessionID            string          `json:"session_id,omitempty"`
+	PipelineID           string          `json:"pipeline_id,omitempty"`
+	TrackID              string          `json:"track_id,omitempty"`
 	Protocol             string          `json:"protocol"`
 	State                string          `json:"state"`
 	Track                Track           `json:"track"`
@@ -49,37 +59,74 @@ type Status struct {
 	Error                string          `json:"error,omitempty"`
 	Streams              map[string]Pull `json:"streams"`
 	Format               string          `json:"format"`
+	EndReason            string          `json:"end_reason,omitempty"`
 }
+
+// A source is either a finite media file (DLNA/Web) or a continuous PCM
+// stream (AirPlay). Protocol names are not used to decide playback behavior.
+type sourceMode uint8
+
+const (
+	streamSource sourceMode = iota
+	fileSource
+)
+
 type session struct {
-	continuation  bool
-	finished      bool
-	id            string
-	ctx           context.Context
-	cancel        context.CancelFunc
-	source        io.ReadCloser
-	mu            sync.Mutex
-	hubs          map[string]*hub
-	queues        map[string]*PCMQueue
-	pulls         map[string]Pull
-	protocol      string
-	track         Track
-	state         string
-	err           string
-	started       time.Time
-	position      float64
-	frames        int64
-	metadataSeq   uint64
-	pullReady     chan struct{}
-	pullOnce      sync.Once
-	playbackStart time.Time
-	displayRev    uint64
-	sourceEnded   bool
-	lastInput     time.Time
-	pausedAt      time.Time
+	awaitMedia      bool
+	mediaStarted    bool
+	account         string
+	equalizerConfig store.Equalizer
+	equalizer       equalizer
+	clipped         uint64
+	prefetched      *prefetch
+	events          []Event
+	hardwareVolume  *int
+	volumeMode      string
+	targetGain      float64
+	continuation    bool
+	finished        bool
+	id              string
+	identity        string // Logical cast; id is the revocable media generation.
+	trackID         string // Protocol-visible track generation, set by the adapter.
+	mode            sourceMode
+	mediaURL        string
+	ctx             context.Context
+	cancel          context.CancelFunc
+	source          io.ReadCloser
+	mu              sync.Mutex
+	hubs            map[string]*hub
+	queues          map[string]*PCMQueue
+	pulls           map[string]Pull
+	protocol        string
+	track           Track
+	state           string
+	err             string
+	started         time.Time
+	position        float64
+	frames          int64
+	metadataSeq     uint64
+	metadataCancel  context.CancelFunc
+	pullReady       chan struct{}
+	pullOnce        sync.Once
+	playbackStart   time.Time
+	displayRev      uint64
+	sourceEnded     bool
+	lastInput       time.Time
+	pausedAt        time.Time
+	desiredPaused   bool
+	published       bool
+	prepared        bool
+	endReason       string
+	changed         chan struct{}
 }
 type Engine struct {
+	transport              http.RoundTripper // Optional media transport; production uses validated LAN dialing.
+	prefetchMu             sync.Mutex
+	prefetch               *prefetch
+	requestedMuted         bool
 	requestedVolume        *int // Protected by op; remembered before playback starts.
 	closed                 bool // Protected by op.
+	closing                atomic.Bool
 	route                  string
 	op                     sync.Mutex
 	mu                     sync.RWMutex
@@ -90,7 +137,11 @@ type Engine struct {
 	secret                 []byte
 	cacheMu                sync.Mutex
 	cachePath, cacheURL    string
+	volumeMu               sync.Mutex
+	sequence               atomic.Uint64
+	lastStart              atomic.Uint64
 	wg                     sync.WaitGroup
+	changes                chan struct{}
 }
 
 func New(ctx context.Context, a *app.App, binary, base, dir string, route ...string) (*Engine, error) {
@@ -108,7 +159,7 @@ func New(ctx context.Context, a *app.App, binary, base, dir string, route ...str
 	if len(route) > 0 {
 		routeID = route[0]
 	}
-	return &Engine{route: routeID, ctx: ctx, app: a, binary: binary, base: strings.TrimRight(base, "/"), cacheDir: dir, secret: secret}, nil
+	return &Engine{route: routeID, ctx: ctx, app: a, binary: binary, base: strings.TrimRight(base, "/"), cacheDir: dir, secret: secret, changes: make(chan struct{}, 1)}, nil
 }
 func (e *Engine) Status() Status {
 	e.mu.RLock()
@@ -120,12 +171,31 @@ func (e *Engine) Status() Status {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	out.Events = append([]Event(nil), s.events...)
+	out.VolumeMode = s.volumeMode
+	out.Equalizer = s.equalizerConfig
+	out.Clipped = s.clipped
 	out.Finished = s.finished
 	out.Protocol = s.protocol
-	out.SessionID = s.id
+	out.SessionID = s.identity
+	out.PipelineID = s.id
+	out.TrackID = s.trackID
 	out.State = s.state
+	out.Activity = s.state
+	if s.state != "paused" && s.state != "stopped" && s.state != "error" {
+		switch {
+		case s.awaitMedia && !s.mediaStarted:
+			// AirPlay: the transport is open but no audible PCM has arrived.
+			out.Activity = "connected"
+		case s.mode == fileSource && s.state == "playing" && s.playbackStart.IsZero():
+			// DLNA: the cloud accepted the command but the speaker has not
+			// opened its stream yet. AirPlay never uses playbackStart.
+			out.Activity = "transitioning"
+		}
+	}
 	out.Track = s.track
 	out.Error = s.err
+	out.EndReason = s.endReason
 	out.Position = s.positionAt(time.Now())
 	if q, ok := s.source.(*PCMQueue); ok {
 		out.InputDroppedBytes = q.DroppedBytes()
@@ -143,23 +213,76 @@ func (e *Engine) isCurrent(s *session) bool {
 	defer e.mu.RUnlock()
 	return e.current == s
 }
-func (e *Engine) newSession(protocol string, track Track, position float64) *session {
+func (e *Engine) newSession(protocol string, track Track, position float64, identity ...string) *session {
+	return e.newSessionFor(modeForProtocol(protocol), protocol, "", track, position, identity...)
+}
+func modeForProtocol(protocol string) sourceMode {
+	if protocol == "dlna" || protocol == "web" {
+		return fileSource
+	}
+	return streamSource
+}
+func (e *Engine) newSessionFor(mode sourceMode, protocol, trackID string, track Track, position float64, identity ...string) *session {
+	if len(identity) == 0 || identity[0] == "" {
+		e.clearPrefetch("")
+	}
 	b := make([]byte, 16)
 	rand.Read(b)
 	ctx, cancel := context.WithCancel(e.ctx)
-	s := &session{id: hex.EncodeToString(b), ctx: ctx, cancel: cancel, hubs: map[string]*hub{}, queues: map[string]*PCMQueue{}, pulls: map[string]Pull{}, protocol: protocol, track: track, state: "transitioning", started: time.Now(), position: position, pullReady: make(chan struct{})}
+	s := &session{id: hex.EncodeToString(b), ctx: ctx, cancel: cancel, hubs: map[string]*hub{}, queues: map[string]*PCMQueue{}, pulls: map[string]Pull{}, protocol: protocol, trackID: trackID, mode: mode, track: track, state: "transitioning", started: time.Now(), position: position, pullReady: make(chan struct{})}
 	e.mu.Lock()
 	old := e.current
+	s.identity = s.id
+	s.changed = make(chan struct{})
+	if len(identity) > 0 && identity[0] != "" {
+		s.identity = identity[0]
+	}
+	config := e.app.Config()
+	s.account = config.Owner
+	s.volumeMode = config.VolumeMode
+	s.equalizerConfig = config.Equalizer
+	if old != nil && old.identity == s.identity {
+		s.volumeMode = old.volumeMode
+		s.equalizerConfig = old.equalizerConfig
+	}
+	// An explicit mute belongs to its protocol cast, not a later takeover.
+	e.volumeMu.Lock()
+	if old != nil && old.protocol != protocol {
+		e.requestedMuted = false
+	}
+	s.equalizer = newEqualizer(s.equalizerConfig)
+	s.targetGain = 1
+	if e.requestedVolume != nil {
+		s.targetGain = volumeGain(*e.requestedVolume)
+	}
+	if e.requestedMuted {
+		s.targetGain = 0
+	}
+	if e.requestedVolume != nil || e.requestedMuted {
+		v := e.effectiveVolume()
+		s.hardwareVolume = &v
+	}
+	e.volumeMu.Unlock()
+	s.events = []Event{{At: time.Now(), Kind: "session_started"}}
 	e.current = s
 	e.mu.Unlock()
 	if old != nil {
 		e.cancel(old)
+		old.mu.Lock()
+		published := old.published
+		old.mu.Unlock()
+		if published {
+			e.cleanupRoute(old)
+		}
 	}
 	return s
 }
 func (e *Engine) cancel(s *session) {
 	s.cancel()
 	s.mu.Lock()
+	if s.prefetched != nil {
+		s.prefetched.cancel()
+	}
 	if s.source != nil {
 		s.source.Close()
 	}
@@ -171,19 +294,16 @@ func (e *Engine) cancel(s *session) {
 	}
 	s.mu.Unlock()
 }
-func (e *Engine) StartPCM(input io.ReadCloser, track Track) (string, error) {
-	e.op.Lock()
-	defer e.op.Unlock()
-	if e.closed {
-		input.Close()
-		return "", errors.New("投送入口已关闭")
-	}
-	s := e.newSession("airplay", track, 0)
-	s.source = input
-	e.prepare(s)
-	e.wg.Add(1)
-	go func() { defer e.wg.Done(); e.consume(s, input) }()
-	return s.id, nil
+func (e *Engine) StartPCM(input io.ReadCloser, track Track, initialVolume ...int) (string, error) {
+	receipt, err := e.StartStream(StartRequest{Track: track}, input, initialVolume...)
+	return receipt.Identity, err
+}
+
+// StartPCMFor restarts an existing protocol transport only if it still owns
+// the cast. Validation and replacement share the same operation lock.
+func (e *Engine) StartPCMFor(owner string, input io.ReadCloser, track Track, initialVolume ...int) (string, error) {
+	receipt, err := e.StartStream(StartRequest{Owner: owner, Seq: e.Sequence(), Continuation: true, Track: track, AwaitMedia: true}, input, initialVolume...)
+	return receipt.Identity, err
 }
 func (e *Engine) prepare(s *session) {
 	e.wg.Add(1)
@@ -199,109 +319,195 @@ func (e *Engine) prepare(s *session) {
 		s.mu.Lock()
 		h := s.hubs[config.Format]
 		s.mu.Unlock()
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-h.ready:
-		case <-time.After(20 * time.Second):
-			e.fail(s, "音频源未产生可播放数据")
+		if !e.waitForMedia(s) {
 			return
 		}
-		e.op.Lock()
-		defer e.op.Unlock()
-		if !e.isCurrent(s) || s.ctx.Err() != nil {
+		if !e.waitReady(s, h.ready) {
 			return
 		}
-		ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
-		defer cancel()
 		s.mu.Lock()
 		track := s.track
 		s.mu.Unlock()
-		audioID := e.match(ctx, track)
-		results, err := e.app.BeginRouteStream(ctx, e.route, "stream:"+s.id, audioID, func(sp store.Speaker) string { return e.url(s, sp) }, s.continuation)
-		if err != nil {
-			e.fail(s, err.Error())
+		audioID := e.match(s.ctx, track)
+		for {
+			if !e.waitRunnable(s) {
+				return
+			}
+			e.op.Lock()
+			if !e.isCurrent(s) || s.ctx.Err() != nil {
+				e.op.Unlock()
+				return
+			}
+			s.mu.Lock()
+			if s.desiredPaused {
+				s.mu.Unlock()
+				e.op.Unlock()
+				continue
+			}
+			s.published = true
+			s.mu.Unlock()
+			ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
+			results, err := e.app.BeginGuardedRouteStream(ctx, e.route, "stream:"+s.id, audioID, func(sp store.Speaker) string { return e.url(s, sp) }, s.continuation, func() bool { return e.sourceLive(s) }, func() { e.retire(s, "targets_lost") }, app.StreamOptions{Background: func() bool { s.mu.Lock(); ended := s.sourceEnded; s.mu.Unlock(); return !ended && e.sourceLive(s) }, Volume: func() (int, bool) {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				if s.volumeMode == "linked" && s.hardwareVolume != nil {
+					return *s.hardwareVolume, true
+				}
+				return 0, false
+			}})
+			if err != nil {
+				cancel()
+				e.op.Unlock()
+				if s.ctx.Err() != nil {
+					return
+				}
+				if errors.Is(err, app.ErrSuperseded) {
+					continue
+				}
+				e.fail(s, err.Error())
+				return
+			}
+			s.mu.Lock()
+			pausedNow := s.desiredPaused
+			s.mu.Unlock()
+			if pausedNow {
+				cancel()
+				e.op.Unlock()
+				continue
+			}
+			if s.ctx.Err() != nil {
+				cancel()
+				e.op.Unlock()
+				return
+			}
+			if len(results) == 0 {
+				cancel()
+				e.op.Unlock()
+				e.retire(s, "targets_lost")
+				return
+			}
+			cancel()
+			accepted := false
+			for _, r := range results {
+				if r == "accepted" {
+					accepted = true
+				}
+			}
+			s.mu.Lock()
+			s.prepared = true
+			if s.state == "transitioning" {
+				if accepted {
+					s.state = "playing"
+				} else {
+					s.err = "音箱尚未接受播放指令"
+					s.state = "waiting_for_speakers"
+				}
+			}
+			s.mu.Unlock()
+			e.op.Unlock()
+			if accepted {
+				s.record("route_ready", "", 0)
+			} else {
+				s.record("route_waiting", "", 0)
+			}
 			return
 		}
-		if e.requestedVolume != nil {
-			_, _ = e.app.ControlRouteSource(ctx, e.route, "stream:"+s.id, "volume", *e.requestedVolume)
-		}
-		accepted := false
-		for _, r := range results {
-			if r == "accepted" {
-				accepted = true
-			}
-		}
-		s.mu.Lock()
-		if s.state == "transitioning" {
-			if accepted {
-				s.state = "playing"
-			} else {
-				s.err = "音箱尚未接受播放指令"
-				s.state = "waiting_for_speakers"
-			}
-		}
-		s.mu.Unlock()
 	}()
 }
 func (e *Engine) watch(s *session) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-	attempts := map[string]int{}
-	last := map[string]time.Time{}
+	recovery := map[string]*recoveryState{}
+	var unavailableSince, observedAt time.Time
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-ticker.C:
+		case now := <-ticker.C:
 			s.mu.Lock()
-			state := s.state
-			ended := s.sourceEnded
-			pulls := map[string]Pull{}
+			state, ended, started, lastInput := s.state, s.sourceEnded, s.started, s.lastInput
+			pulls := make(map[string]Pull, len(s.pulls))
 			for id, p := range s.pulls {
 				pulls[id] = p
 			}
-			started := s.started
-			lastInput := s.lastInput
 			hubs := make(map[string]*hub, len(s.hubs))
-			for format, h := range s.hubs {
-				hubs[format] = h
+			for f, h := range s.hubs {
+				hubs[f] = h
 			}
 			s.mu.Unlock()
-			if ended || (state != "playing" && state != "waiting_for_speakers") || time.Since(started) < 6*time.Second {
+			if !ended && (state == "playing" || state == "paused" || state == "waiting_for_speakers") && now.Sub(observedAt) >= 30*time.Second {
+				observedAt = now
+				ctx, cancel := context.WithTimeout(s.ctx, 6*time.Second)
+				e.app.ObserveRoute(ctx, e.route, "stream:"+s.id)
+				cancel()
+				// Readback can wait on the network; recovery must use fresh flow data.
+				s.mu.Lock()
+				state, ended, started, lastInput = s.state, s.sourceEnded, s.started, s.lastInput
+				clear(pulls)
+				for id, p := range s.pulls {
+					pulls[id] = p
+				}
+				clear(hubs)
+				for format, h := range s.hubs {
+					hubs[format] = h
+				}
+				s.mu.Unlock()
+				now = time.Now()
+			}
+			if ended || (state != "playing" && state != "waiting_for_speakers") || now.Sub(started) < 6*time.Second {
+				unavailableSince = time.Time{}
 				continue
 			}
+			healthy := false
 			ids := map[string]bool{}
 			for _, target := range e.app.Config().RouteTargets(e.route) {
+				if !e.app.RouteOwns(e.route, target.ID) {
+					continue
+				}
 				p := pulls[target.ID]
-				if time.Since(p.LastRead) < 5*time.Second {
-					attempts[target.ID] = 0
-					continue
+				if !p.LastRead.IsZero() && now.Sub(p.LastRead) < 5*time.Second {
+					healthy = true
 				}
-				// A source/encoder hole is not a failed speaker. Reissuing the
-				// cloud play command during the hole causes a reconnect/refill cycle.
-				if !retryHealthySource(time.Now(), lastInput, hubs[target.Format]) {
-					continue
+				r := recovery[target.ID]
+				if r == nil {
+					r = &recoveryState{}
+					recovery[target.ID] = r
 				}
-				if attempts[target.ID] >= 3 || time.Since(last[target.ID]) < time.Duration(3*(1<<attempts[target.ID]))*time.Second {
-					continue
-				}
-				ids[target.ID] = true
+				retry, recovered, health := r.check(now, p, retryHealthySource(now, lastInput, hubs[target.Format]))
 				s.mu.Lock()
-				p = s.pulls[target.ID]
-				p.Retries++
-				s.pulls[target.ID] = p
+				current := s.pulls[target.ID]
+				current.Health = health
+				if retry {
+					current.Retries++
+				}
+				s.pulls[target.ID] = current
 				s.mu.Unlock()
-				slog.Warn("音箱取流停滞，重试播放", "speaker", target.ID, "retry", p.Retries)
-				attempts[target.ID]++
-				last[target.ID] = time.Now()
+				if recovered {
+					s.record("recovery_confirmed", target.ID, 0)
+				}
+				if retry {
+					ids[target.ID] = true
+					s.record("recovery_requested", target.ID, r.attempts)
+				}
+			}
+			if healthy {
+				unavailableSince = time.Time{}
+			} else if unavailableSince.IsZero() {
+				unavailableSince = now
+			} else if now.Sub(unavailableSince) > 90*time.Second {
+				s.record("recovery_exhausted", "", 0)
+				e.fail(s, "音箱持续无法拉取音频流")
+				return
 			}
 			if len(ids) > 0 {
 				e.op.Lock()
 				if e.isCurrent(s) && s.ctx.Err() == nil {
 					ctx, cancel := context.WithTimeout(s.ctx, 8*time.Second)
-					_ = e.app.RetryRouteTargets(ctx, e.route, "stream:"+s.id, ids)
+					err := e.app.RetryRouteTargets(ctx, e.route, "stream:"+s.id, ids)
 					cancel()
+					if err != nil && s.ctx.Err() == nil {
+						s.record("recovery_command_failed", "", 0)
+					}
 				}
 				e.op.Unlock()
 			}
@@ -359,7 +565,7 @@ func (e *Engine) consume(s *session, input io.Reader) {
 		}
 		s.mu.Unlock()
 		if s.ctx.Err() == nil {
-			if s.protocol == "dlna" {
+			if s.mode == fileSource {
 				s.mu.Lock()
 				waiting := s.playbackStart.IsZero()
 				s.mu.Unlock()
@@ -369,22 +575,29 @@ func (e *Engine) consume(s *session, input io.Reader) {
 						return
 					case <-s.pullReady:
 					case <-time.After(25 * time.Second):
+						e.fail(s, "音箱未连接本地音频流")
 						return
 					}
 				}
 			}
-			timer := time.NewTimer(7 * time.Second)
-			defer timer.Stop()
-			select {
-			case <-s.ctx.Done():
-			case <-timer.C:
-				e.stop(s.id, true)
+			if s.mode == fileSource {
+				e.finishMedia(s)
+			} else {
+				select {
+				case <-s.ctx.Done():
+				case <-time.After(7 * time.Second):
+					e.stop(s.id, true)
+				}
 			}
 		}
 	}()
 	buffer := make([]byte, 4096)
+	s.mu.Lock()
+	gain := s.targetGain
+	s.mu.Unlock()
+	pending := []byte{}
 	for {
-		if s.protocol == "dlna" {
+		if s.mode == fileSource {
 			s.mu.Lock()
 			frames, start := s.frames, s.playbackStart
 			s.mu.Unlock()
@@ -416,7 +629,7 @@ func (e *Engine) consume(s *session, input io.Reader) {
 		}
 		for {
 			s.mu.Lock()
-			paused := s.state == "paused" && s.protocol == "dlna"
+			paused := s.state == "paused" && s.mode == fileSource
 			s.mu.Unlock()
 			if !paused {
 				break
@@ -428,14 +641,34 @@ func (e *Engine) consume(s *session, input io.Reader) {
 			}
 		}
 		n, err := input.Read(buffer)
+		data := append(pending, buffer[:n]...)
+		aligned := len(data) / 4 * 4
+		pending = append([]byte(nil), data[aligned:]...)
+		data = data[:aligned]
+		n = len(data)
 		if n > 0 {
 			s.mu.Lock()
 			s.lastInput = time.Now()
+			if s.awaitMedia && !s.mediaStarted {
+				if !pcmHasContent(data) {
+					s.mu.Unlock()
+					if err != nil {
+						return
+					}
+					continue
+				}
+				s.mediaStarted = true
+			}
+			s.signalLocked()
 			s.frames += int64(n / 4)
+			s.clipped += s.equalizer.process(data)
+			if s.volumeMode != "linked" {
+				applyGain(data, &gain, s.targetGain)
+			}
 			for format, h := range s.hubs {
 				if format == "wav" || format == "pcm" {
-					h.Write(buffer[:n])
-				} else if !s.queues[format].Push(buffer[:n]) {
+					h.Write(data)
+				} else if !s.queues[format].Push(data) {
 					s.err = "音频处理积压，部分帧被丢弃"
 				}
 			}
@@ -452,12 +685,77 @@ func (e *Engine) consume(s *session, input io.Reader) {
 		}
 	}
 }
+
+// EOF precedes audible completion. Follow the playback clock and pauses
+// rather than imposing a fixed seven-second gap after every track.
+func (e *Engine) finishMedia(s *session) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		drain := liveReserve
+		for _, speaker := range e.app.Config().RouteTargets(e.route) {
+			drain = max(drain, time.Duration(speaker.DelayMS)*time.Millisecond+liveReserve)
+		}
+		s.mu.Lock()
+		ready := s.state != "paused" && s.state != "error" && !s.playbackStart.IsZero() &&
+			time.Since(s.playbackStart) >= time.Duration(float64(s.frames)/44100*float64(time.Second))+drain
+		ready = ready && !s.desiredPaused
+		for _, p := range s.pulls {
+			// A renderer may close at the media boundary before our handler
+			// observes EOF. Once the source clock has drained, a historical
+			// incomplete request must not turn natural EOF into a failure.
+			if p.Connections > 0 {
+				ready = false
+			}
+		}
+		timedOut := !s.desiredPaused && s.state != "paused" && !s.playbackStart.IsZero() && time.Since(s.playbackStart) > time.Duration(float64(s.frames)/44100*float64(time.Second))+drain+15*time.Second
+		s.mu.Unlock()
+		if ready {
+			e.stop(s.id, true)
+			return
+		}
+		if timedOut {
+			e.fail(s, "音箱未完成音频读取")
+			return
+		}
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
 func (e *Engine) fail(s *session, message string) {
 	s.mu.Lock()
+	if s.ctx.Err() != nil || s.state == "stopped" || s.state == "error" {
+		s.mu.Unlock()
+		return
+	}
 	s.err = message
 	s.state = "error"
+	s.endReason = "failed"
+	s.finished = false
 	s.mu.Unlock()
+	e.clearPrefetch(s.identity)
+	s.record("session_failed", "", 0)
+	e.cancel(s)
+	e.notifyChange()
+	// fail may run while op is held by prepare. Cleanup is generation-scoped
+	// and tracked, so it cannot stop a newer source or outlive Engine.Close.
+	e.cleanupRoute(s)
 	slog.Warn("播放链路异常", "protocol", s.protocol, "reason", message)
+}
+
+func (e *Engine) cleanupRoute(s *session) {
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		e.op.Lock()
+		defer e.op.Unlock()
+		ctx, cancel := context.WithTimeout(e.ctx, 8*time.Second)
+		defer cancel()
+		_, _ = e.app.ControlRouteSource(ctx, e.route, "stream:"+s.id, "stop", 0)
+	}()
 }
 func (e *Engine) token(s *session, id string) string {
 	m := hmac.New(sha256.New, e.secret)
@@ -543,7 +841,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.mu.Lock()
-	firstPull := s.protocol == "dlna" && s.playbackStart.IsZero()
+	firstPull := s.mode == fileSource && s.playbackStart.IsZero()
 	if firstPull {
 		s.playbackStart = time.Now()
 		s.pullOnce.Do(func() { close(s.pullReady) })
@@ -554,9 +852,21 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.err = ""
 	}
 	p.Connections++
+	p.Completed = false
 	s.pulls[speaker.ID] = p
 	s.mu.Unlock()
-	defer func() { s.mu.Lock(); p := s.pulls[speaker.ID]; p.Connections--; s.pulls[speaker.ID] = p; s.mu.Unlock() }()
+	if firstPull {
+		s.record("stream_pulled", speaker.ID, 0)
+	}
+	drained := false
+	defer func() {
+		s.mu.Lock()
+		p := s.pulls[speaker.ID]
+		p.Connections--
+		p.Completed = p.Completed || drained
+		s.pulls[speaker.ID] = p
+		s.mu.Unlock()
+	}()
 	cursor := uint64(0)
 	if firstPull {
 		h.mu.Lock()
@@ -569,6 +879,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	line := &delayLine{}
 	ended := false
 	lastWrite := time.Now()
+	formatRecorded := false
 	for {
 		allowed := false
 		for _, sp := range e.app.Config().RouteTargets(e.route) {
@@ -586,6 +897,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		bridged := false
 		if !send {
 			if ended {
+				drained = true
 				return
 			}
 			ctx, cancel := context.WithTimeout(r.Context(), bridgeGap)
@@ -636,6 +948,10 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		lastWrite = time.Now()
+		if !formatRecorded && n > 0 {
+			e.app.RecordFormat(s.account, speaker.ID, parts[2])
+			formatRecorded = true
+		}
 		s.mu.Lock()
 		p := s.pulls[speaker.ID]
 		if bridged {
@@ -651,38 +967,106 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 }
-func (e *Engine) Stop(owner string) { e.stop(owner, false) }
+
+// Changes signals lifecycle updates; observers read a fresh Status snapshot.
+func (e *Engine) Changes() <-chan struct{} { return e.changes }
+func (e *Engine) notifyChange() {
+	select {
+	case e.changes <- struct{}{}:
+	default:
+	}
+}
+func (e *Engine) Stop(owner string) { e.stopSession(owner, false, true) }
 func (e *Engine) stop(owner string, finished bool) {
+	e.stopSession(owner, finished, false)
+}
+func (e *Engine) stopSession(owner string, finished, logical bool) {
+	e.mu.RLock()
+	intent := e.current
+	e.mu.RUnlock()
+	if intent != nil && (owner == "" || owner == intent.id || (logical && owner == intent.identity)) {
+		intent.mu.Lock()
+		prepared := intent.prepared
+		intent.mu.Unlock()
+		if !finished || prepared {
+			e.app.SetRouteIntent(e.route, "stream:"+intent.id, true)
+		}
+	}
+	if !finished {
+		if intent != nil && (owner == "" || owner == intent.id || (logical && owner == intent.identity)) {
+			e.clearPrefetch(intent.identity)
+		}
+		e.mu.RLock()
+		selected := e.current
+		e.mu.RUnlock()
+		if selected != nil && (owner == "" || owner == selected.id || (logical && owner == selected.identity)) {
+			if owner == "" {
+				owner = selected.identity
+			}
+			e.cancel(selected)
+		}
+		if selected == nil {
+			return
+		}
+	}
 	e.op.Lock()
 	defer e.op.Unlock()
 	e.mu.RLock()
 	s := e.current
 	e.mu.RUnlock()
-	if s == nil || (owner != "" && owner != s.id) {
+	if s == nil || (owner != "" && owner != s.id && (!logical || owner != s.identity)) {
 		return
 	}
 	s.mu.Lock()
-	if s.state == "stopped" {
-		if !finished {
-			s.finished = false
-		}
+	if finished && (s.ctx.Err() != nil || s.state == "error" || s.state == "paused" || s.desiredPaused) {
 		s.mu.Unlock()
 		return
 	}
+	if s.state == "stopped" {
+		if !finished {
+			s.finished = false
+			s.endReason = "stopped"
+		}
+		s.mu.Unlock()
+		if !finished {
+			e.notifyChange()
+		}
+		return
+	}
 	s.finished = finished && s.ctx.Err() == nil
+	if s.finished {
+		s.endReason = "media_finished"
+	} else {
+		s.endReason = "stopped"
+	}
 	s.mu.Unlock()
 	e.cancel(s)
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(e.ctx, 8*time.Second)
 	defer cancel()
 	_, _ = e.app.ControlRouteSource(ctx, e.route, "stream:"+s.id, "stop", 0)
 	s.mu.Lock()
 	s.state = "stopped"
 	s.mu.Unlock()
+	e.notifyChange()
 }
-func (e *Engine) Pause(ctx context.Context) error {
+
+// A nonempty owner scopes protocol commands to their logical cast. Web
+// controls omit it and select the current cast atomically under op.
+func (e *Engine) Pause(ctx context.Context, owner ...string) error {
+	e.mu.RLock()
+	selected := e.current
+	e.mu.RUnlock()
+	if selected == nil || !ownsSession(selected, owner) || selected.ctx.Err() != nil {
+		return nil
+	}
+	selected.mu.Lock()
+	selected.desiredPaused = true
+	selected.signalLocked()
+	selected.mu.Unlock()
+	e.app.SetRouteIntent(e.route, "stream:"+selected.id, true)
 	e.op.Lock()
 	defer e.op.Unlock()
-	if e.closed {
+	if e.closed || e.closing.Load() {
 		return errors.New("投送入口已关闭")
 	}
 	e.mu.RLock()
@@ -691,82 +1075,113 @@ func (e *Engine) Pause(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	_, err := e.app.ControlRouteSource(ctx, e.route, "stream:"+s.id, "pause", 0)
+	if !ownsSession(s, owner) || s.ctx.Err() != nil {
+		return nil
+	}
+	if s != selected {
+		return nil
+	}
+	results, err := e.app.ControlRouteSource(ctx, e.route, "stream:"+s.id, "pause", 0)
+	if err = commandError(results, err); err != nil {
+		s.mu.Lock()
+		s.desiredPaused = false
+		s.signalLocked()
+		s.mu.Unlock()
+		e.app.SetRouteIntent(e.route, "stream:"+s.id, false)
+		return err
+	}
 	s.mu.Lock()
 	if s.state != "paused" {
 		s.pausedAt = time.Now()
 	}
 	s.state = "paused"
+	s.signalLocked()
 	s.mu.Unlock()
 	return err
 }
-func (e *Engine) Resume(ctx context.Context) error {
+func (e *Engine) Resume(ctx context.Context, owner ...string) error {
+	e.op.Lock()
+	defer e.op.Unlock()
+	if e.closed || e.closing.Load() {
+		return errors.New("投送入口已关闭")
+	}
 	e.mu.RLock()
 	s := e.current
 	e.mu.RUnlock()
 	if s == nil {
 		return errors.New("没有可恢复的播放")
 	}
-	if s.protocol == "dlna" {
-		s.mu.Lock()
-		track, pos := s.track, s.positionAt(time.Now())
-		s.mu.Unlock()
-		e.cacheMu.Lock()
-		raw := e.cacheURL
-		e.cacheMu.Unlock()
-		_, err := e.PlayMedia(raw, track, pos, true)
-		return err
-	}
-	e.op.Lock()
-	defer e.op.Unlock()
-	_, err := e.app.ControlRouteSource(ctx, e.route, "stream:"+s.id, "play", 0)
-	s.mu.Lock()
-	s.state = "playing"
-	s.mu.Unlock()
-	return err
-}
-func (e *Engine) Volume(ctx context.Context, value int) error {
-	e.op.Lock()
-	defer e.op.Unlock()
-	if e.closed {
-		return errors.New("投送入口已关闭")
-	}
-	e.requestedVolume = new(int)
-	*e.requestedVolume = value
-	e.mu.RLock()
-	s := e.current
-	e.mu.RUnlock()
-	if s == nil {
+	if !ownsSession(s, owner) {
 		return nil
 	}
-	_, err := e.app.ControlRouteSource(ctx, e.route, "stream:"+s.id, "volume", value)
+	s.mu.Lock()
+	s.desiredPaused = false
+	s.signalLocked()
+	published := s.published
+	s.mu.Unlock()
+	e.app.SetRouteIntent(e.route, "stream:"+s.id, false)
+	if s.mode == fileSource {
+		s.mu.Lock()
+		track, pos, trackID := s.track, s.positionAt(time.Now()), s.trackID
+		s.mu.Unlock()
+		_, err := e.startLocked(startSpec{mode: fileSource, protocol: s.protocol, trackID: trackID, owner: s.identity, uri: s.mediaURL, track: track, position: pos, continuation: true})
+		return err
+	}
+	if s.ctx.Err() != nil {
+		return errors.New("播放会话已结束")
+	}
+	if !published {
+		s.mu.Lock()
+		s.state = "transitioning"
+		s.signalLocked()
+		s.mu.Unlock()
+		return nil
+	}
+	results, err := e.app.ControlRouteSource(ctx, e.route, "stream:"+s.id, "play", 0)
+	if err = commandError(results, err); err != nil {
+		return err
+	}
+	if s.ctx.Err() != nil {
+		return s.ctx.Err()
+	}
+	s.mu.Lock()
+	s.state = "playing"
+	s.signalLocked()
+	s.mu.Unlock()
 	return err
 }
 func (e *Engine) Metadata(owner string, track Track) {
 	e.op.Lock()
 	defer e.op.Unlock()
-	if e.closed {
+	if e.closed || e.closing.Load() {
 		return
 	}
 	e.mu.RLock()
 	s := e.current
 	e.mu.RUnlock()
-	if s == nil || s.id != owner {
+	if s == nil || s.identity != owner || s.ctx.Err() != nil {
 		return
 	}
 	s.mu.Lock()
-	if s.track.Title == track.Title && s.track.Artist == track.Artist {
+	same := s.track.Title == track.Title && s.track.Artist == track.Artist
+	s.track = track
+	if same {
 		s.mu.Unlock()
 		return
 	}
-	s.track = track
 	s.metadataSeq++
 	seq := s.metadataSeq
+	if s.metadataCancel != nil {
+		s.metadataCancel()
+	}
+	metadataCtx, cancelMetadata := context.WithCancel(s.ctx)
+	s.metadataCancel = cancelMetadata
 	s.mu.Unlock()
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		id := e.match(s.ctx, track)
+		defer cancelMetadata()
+		id := e.match(metadataCtx, track)
 		if id == "" {
 			return
 		}
@@ -776,7 +1191,7 @@ func (e *Engine) Metadata(owner string, track Track) {
 			return
 		}
 		s.mu.Lock()
-		valid := s.metadataSeq == seq && s.state == "playing"
+		valid := s.metadataSeq == seq && s.state == "playing" && !s.desiredPaused && !s.sourceEnded && (s.protocol != "airplay" || time.Since(s.lastInput) < time.Second)
 		if valid {
 			s.displayRev++
 		}
@@ -789,6 +1204,15 @@ func (e *Engine) Metadata(owner string, track Track) {
 	}()
 }
 func (e *Engine) Close() {
+	e.closing.Store(true)
+	e.clearPrefetch("")
+	e.mu.RLock()
+	selected := e.current
+	e.mu.RUnlock()
+	if selected != nil {
+		e.cancel(selected)
+		e.app.SetRouteIntent(e.route, "stream:"+selected.id, true)
+	}
 	e.op.Lock()
 	e.closed = true
 	e.op.Unlock()
@@ -801,23 +1225,46 @@ func (e *Engine) Close() {
 	}
 }
 func (e *Engine) RuntimePath() string { return filepath.Base(e.binary) }
-func (e *Engine) Seek(seconds float64) error {
+func (e *Engine) Seek(seconds float64, owner ...string) error {
 	if seconds < 0 || seconds > 24*3600 {
 		return errors.New("无效播放位置")
+	}
+	e.op.Lock()
+	defer e.op.Unlock()
+	if e.closed || e.closing.Load() {
+		return errors.New("投送入口已关闭")
 	}
 	e.mu.RLock()
 	s := e.current
 	e.mu.RUnlock()
-	if s == nil || s.protocol != "dlna" {
+	if s == nil || s.mode != fileSource {
 		return errors.New("当前音源不支持定位")
 	}
+	if !ownsSession(s, owner) {
+		return nil
+	}
 	s.mu.Lock()
-	track := s.track
+	track, trackID := s.track, s.trackID
 	s.mu.Unlock()
-	e.cacheMu.Lock()
-	raw := e.cacheURL
-	e.cacheMu.Unlock()
-	_, err := e.PlayMedia(raw, track, seconds, true)
+	_, err := e.startLocked(startSpec{mode: fileSource, protocol: s.protocol, trackID: trackID, owner: s.identity, uri: s.mediaURL, track: track, position: seconds, continuation: true})
 	return err
+}
+
+func ownsSession(s *session, owner []string) bool {
+	return len(owner) == 0 || (owner[0] != "" && owner[0] == s.identity)
+}
+
+func commandError(results map[string]string, err error) error {
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, result := range results {
+		if result == "accepted" {
+			return nil
+		}
+		failures = append(failures, errors.New(result))
+	}
+	return errors.Join(failures...)
 }
 func (e *Engine) String() string { return fmt.Sprintf("audio runtime: %s", filepath.Base(e.binary)) }

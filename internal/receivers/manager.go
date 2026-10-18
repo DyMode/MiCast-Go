@@ -28,17 +28,18 @@ type Options struct {
 	Discovery                                              bool
 }
 type Status struct {
-	Targets        []string        `json:"targets"`
-	Owned          []string        `json:"owned"`
-	ID             string          `json:"id"`
-	Name           string          `json:"name"`
-	Kind           string          `json:"kind"`
-	SpeakerID      string          `json:"speaker_id,omitempty"`
-	Airplay        string          `json:"airplay"`
-	AirplayAddress string          `json:"airplay_address,omitempty"`
-	DLNA           string          `json:"dlna"`
-	DescriptionURL string          `json:"description_url"`
-	Playback       playback.Status `json:"playback"`
+	Targets        []string          `json:"targets"`
+	Owned          []string          `json:"owned"`
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	Kind           string            `json:"kind"`
+	SpeakerID      string            `json:"speaker_id,omitempty"`
+	Airplay        string            `json:"airplay"`
+	AirplayAddress string            `json:"airplay_address,omitempty"`
+	DLNA           string            `json:"dlna"`
+	DescriptionURL string            `json:"description_url"`
+	Protocol       *dlna.Diagnostics `json:"dlna_protocol,omitempty"`
+	Playback       playback.Status   `json:"playback"`
 }
 type entry struct {
 	id, name, owner, prefix string
@@ -129,10 +130,13 @@ func (m *Manager) Sync() error {
 	}
 	m.mu.Lock()
 	var removed []*entry
+	renamed := map[*entry]string{}
 	for id, e := range m.entries {
-		if name, keep := desired[id]; !keep || name != e.name || c.Owner != e.owner {
+		if name, keep := desired[id]; !keep || c.Owner != e.owner {
 			delete(m.entries, id)
 			removed = append(removed, e)
+		} else if name != e.name {
+			renamed[e] = name
 		}
 	}
 	m.mu.Unlock()
@@ -140,6 +144,18 @@ func (m *Manager) Sync() error {
 		e.close()
 	}
 	var failures []error
+	for e, name := range renamed {
+		if e.airplay != nil {
+			if err := e.airplay.Rename(name); err != nil {
+				failures = append(failures, err)
+				continue
+			}
+		}
+		e.dlna.Rename(name)
+		m.mu.Lock()
+		e.name, e.status.Name = name, name
+		m.mu.Unlock()
+	}
 	// The whole-house listener keeps its documented port and root URLs.
 	ids := []string{}
 	if whole {
@@ -235,6 +251,10 @@ func (m *Manager) Status() []Status {
 	for _, e := range m.entries {
 		s := e.status
 		s.Playback = e.engine.Status()
+		if e.dlna != nil {
+			info := e.dlna.Diagnostics()
+			s.Protocol = &info
+		}
 		s.Targets = []string{}
 		for _, sp := range m.app.Config().RouteTargets(e.id) {
 			s.Targets = append(s.Targets, sp.ID)

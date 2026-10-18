@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"strconv"
 	"time"
 )
 
@@ -43,57 +41,34 @@ func validMediaURL(raw string) bool {
 	return err == nil && u.Hostname() != "" && u.User == nil && (u.Scheme == "http" || u.Scheme == "https")
 }
 func (e *Engine) PlayMedia(raw string, track Track, position float64, continuation ...bool) (string, error) {
-	if !validMediaURL(raw) || position < 0 || position > 86400 {
-		return "", errors.New("无效媒体地址或播放位置")
-	}
+	receipt, err := e.StartFile(StartRequest{Protocol: "dlna", URI: raw, Track: track, Position: position, Continuation: len(continuation) > 0 && continuation[0]})
+	return receipt.Identity, err
+}
+
+// AdvanceMedia validates completion and replaces the generation in one
+// transaction. A delayed completion must never replace a newer AirPlay cast.
+func (e *Engine) AdvanceMedia(owner, raw string, track Track) (string, error) {
+	receipt, err := e.AdvanceFile(StartRequest{Owner: owner, URI: raw, Track: track, Continuation: true})
+	return receipt.Identity, err
+}
+
+// AdvanceFile is AdvanceMedia with an explicit command order.
+func (e *Engine) AdvanceFile(req StartRequest) (Receipt, error) {
 	e.op.Lock()
 	defer e.op.Unlock()
-	if e.closed {
-		return "", errors.New("投送入口已关闭")
+	e.mu.RLock()
+	s := e.current
+	e.mu.RUnlock()
+	if s == nil || req.Owner == "" || s.identity != req.Owner || s.mode != fileSource {
+		return Receipt{}, errors.New("播放会话已被新的投放替代")
 	}
-	s := e.newSession("dlna", track, position)
-	s.continuation = len(continuation) > 0 && continuation[0]
-	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
-		path, err := e.download(s, raw)
-		if err != nil {
-			if s.ctx.Err() == nil {
-				e.fail(s, "媒体下载失败，请检查来源地址和文件大小")
-			}
-			return
-		}
-		reader, writer := io.Pipe()
-		s.mu.Lock()
-		s.source = reader
-		s.mu.Unlock()
-		defer reader.Close()
-		args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,aac,flac,wav,mov,mp4,m4a,3gp,3g2,mj2,ogg"}
-		if position > 0 {
-			args = append(args, "-ss", strconv.FormatFloat(position, 'f', 3, 64))
-		}
-		args = append(args, "-i", path)
-		args = append(args, "-map", "0:a:0", "-vn", "-sn", "-dn", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", "-f", "s16le", "pipe:1")
-		command := exec.CommandContext(s.ctx, e.binary, args...)
-		command.Stdout = writer
-		command.Stderr = io.Discard
-		command.WaitDelay = 2 * time.Second
-		if err = command.Start(); err != nil {
-			writer.CloseWithError(err)
-			e.fail(s, "无法启动媒体解码")
-			return
-		}
-		e.prepare(s)
-		done := make(chan struct{})
-		go func() { defer close(done); e.consume(s, reader) }()
-		err = command.Wait()
-		if err != nil && s.ctx.Err() == nil {
-			e.fail(s, "媒体解码失败或格式不支持")
-		}
-		writer.Close()
-		<-done
-	}()
-	return s.id, nil
+	s.mu.Lock()
+	finished := s.finished && s.state == "stopped"
+	s.mu.Unlock()
+	if !finished {
+		return Receipt{}, errors.New("当前媒体尚未播放结束")
+	}
+	return e.startLocked(startSpec{mode: fileSource, protocol: "dlna", trackID: req.TrackID, owner: req.Owner, uri: req.URI, track: req.Track, position: 0, continuation: true, seq: req.Seq})
 }
 func (e *Engine) download(s *session, raw string) (string, error) {
 	e.cacheMu.Lock()
@@ -103,7 +78,44 @@ func (e *Engine) download(s *session, raw string) (string, error) {
 		return path, nil
 	}
 	e.cacheMu.Unlock()
-	ctx, cancel := context.WithTimeout(s.ctx, 120*time.Second)
+	path := ""
+	if p := s.prefetched; p != nil {
+		select {
+		case <-s.ctx.Done():
+			p.cancel()
+			return "", s.ctx.Err()
+		case <-p.done:
+		}
+		p.mu.Lock()
+		path = p.path
+		p.path = ""
+		p.mu.Unlock()
+		p.cancel()
+	}
+	var err error
+	if path == "" {
+		path, err = e.fetchMedia(s.ctx, raw)
+		if err != nil {
+			return "", err
+		}
+	}
+	e.op.Lock()
+	defer e.op.Unlock()
+	if !e.isCurrent(s) || s.ctx.Err() != nil {
+		os.Remove(path)
+		return "", context.Canceled
+	}
+	e.cacheMu.Lock()
+	old := e.cachePath
+	e.cachePath, e.cacheURL = path, raw
+	e.cacheMu.Unlock()
+	if old != "" && old != path {
+		os.Remove(old)
+	}
+	return path, nil
+}
+func (e *Engine) fetchMedia(parent context.Context, raw string) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, 120*time.Second)
 	defer cancel()
 	transport := mediaTransport()
 	defer transport.CloseIdleConnections()
@@ -113,6 +125,9 @@ func (e *Engine) download(s *session, raw string) (string, error) {
 		}
 		return nil
 	}}
+	if e.transport != nil {
+		client.Transport = e.transport
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", raw, nil)
 	if err != nil {
 		return "", err
@@ -146,18 +161,8 @@ func (e *Engine) download(s *session, raw string) (string, error) {
 	if err = f.Close(); err != nil {
 		return "", err
 	}
-	e.op.Lock()
-	defer e.op.Unlock()
-	if !e.isCurrent(s) || s.ctx.Err() != nil {
-		return "", context.Canceled
-	}
-	e.cacheMu.Lock()
-	old := e.cachePath
-	e.cachePath = path
-	e.cacheURL = raw
-	e.cacheMu.Unlock()
-	if old != "" && old != path {
-		os.Remove(old)
+	if ctx.Err() != nil {
+		return "", ctx.Err()
 	}
 	keep = true
 	return path, nil

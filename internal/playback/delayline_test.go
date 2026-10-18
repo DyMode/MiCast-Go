@@ -121,7 +121,7 @@ func TestSpeakerRetryRequiresFlowingSourceAndEncoder(t *testing.T) {
 
 func TestDecodedLookAheadIsNotSkippedWhenResumingFiniteMedia(t *testing.T) {
 	now := time.Now()
-	s := &session{protocol: "dlna", position: 10, frames: 7 * 44100, playbackStart: now.Add(-5 * time.Second)}
+	s := &session{protocol: "dlna", mode: fileSource, position: 10, frames: 7 * 44100, playbackStart: now.Add(-5 * time.Second)}
 	if got := s.positionAt(now); got != 15 {
 		t.Fatal("decoded look-ahead counted as played", got)
 	}

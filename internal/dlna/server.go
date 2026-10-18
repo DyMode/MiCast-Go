@@ -30,28 +30,52 @@ var serviceTypes = map[string]string{"AVTransport": "urn:schemas-upnp-org:servic
 const protocols = "http-get:*:audio/mpeg:*,http-get:*:audio/mp4:*,http-get:*:audio/aac:*,http-get:*:audio/flac:*,http-get:*:audio/wav:*"
 
 type subscription struct {
+	pending                     []string
+	revision                    uint64
+	retryAt                     time.Time
+	failures                    int
 	id, service, callback, peer string
+	targets                     []callbackTarget
 	expires                     time.Time
 	sequence                    uint32
 	last                        string
 	busy                        bool
 }
 type Server struct {
-	bootID                uint32
-	discovery             *Discovery
-	ownsDiscovery         bool
+	bootID        uint32
+	discovery     *Discovery
+	ownsDiscovery bool
+	ctx           context.Context
+	cancel        context.CancelFunc
+	engine        *playback.Engine
+	name, base    string
+	uuid          string
+
+	// mu protects subscriptions, trace and the advertised name. Protocol
+	// state lives under stateMu and never shares a lock with engine calls.
+	mu            sync.Mutex
+	eventsWake    chan struct{}
+	trace         []ProtocolEvent
+	subscriptions map[string]*subscription
+	pollAt        time.Time
+	pollState     string
+	pollDuration  string
+	wg            sync.WaitGroup
+
+	stateMu               sync.Mutex
+	cast                  uint64
+	trackID               uint64
+	desired               string
+	uri, metadata         string
 	nextURI, nextMetadata string
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	engine                *playback.Engine
-	name, base, uuid      string
-	mu                    sync.Mutex
-	uri, metadata, owner  string
+	owner                 string
+	engineTrackID         string
+	positionBase          float64
+	pendingStarts         int
+	lastError             string
 	track                 playback.Track
-	volume, beforeMute    int
-	muted                 bool
-	subscriptions         map[string]*subscription
-	wg                    sync.WaitGroup
+	nextTrack             playback.Track
+	jobs                  chan job
 }
 
 func New(ctx context.Context, e *playback.Engine, name, base, identity string) *Server {
@@ -59,9 +83,11 @@ func New(ctx context.Context, e *playback.Engine, name, base, identity string) *
 	digest := sha256.Sum256([]byte("micast-go/dlna/" + identity))
 	h := hex.EncodeToString(digest[:16])
 	uuid := h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
-	s := &Server{bootID: uint32(time.Now().Unix()) + bootSequence.Add(1), ctx: ctx, cancel: cancel, engine: e, name: name, base: strings.TrimRight(base, "/"), uuid: "uuid:" + uuid, volume: 50, subscriptions: map[string]*subscription{}}
-	s.wg.Add(1)
+	s := &Server{bootID: uint32(time.Now().Unix()) + bootSequence.Add(1), ctx: ctx, cancel: cancel, engine: e, name: name, base: strings.TrimRight(base, "/"), uuid: "uuid:" + uuid, subscriptions: map[string]*subscription{}, eventsWake: make(chan struct{}, 1), jobs: make(chan job, 64), desired: "STOPPED"}
+	s.wg.Add(3)
 	go s.events()
+	go s.lifecycle()
+	go s.worker()
 	return s
 }
 func (s *Server) StartDiscovery(iface *net.Interface) error {
@@ -75,6 +101,7 @@ func (s *Server) StartDiscovery(iface *net.Interface) error {
 }
 func (s *Server) Close() {
 	s.cancel()
+	s.engine.Preempt(s.currentOwner())
 	if s.discovery != nil {
 		s.discovery.Remove(s)
 		if s.ownsDiscovery {
@@ -117,8 +144,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	service, route := pieces[0], pieces[1]
 	switch {
 	case route == "scpd.xml" && r.Method == "GET":
-		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-		io.WriteString(w, scpd(service))
+		writeXML(w, http.StatusOK, scpd(service))
 	case route == "control" && r.Method == "POST":
 		s.control(w, r, service)
 	case route == "event" && (r.Method == "SUBSCRIBE" || r.Method == "UNSUBSCRIBE"):
@@ -128,15 +154,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (s *Server) description(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	s.mu.Lock()
+	name := s.name
+	s.mu.Unlock()
 	baseURL, _ := url.Parse(s.base)
 	prefix := strings.TrimRight(baseURL.Path, "/")
 	var services strings.Builder
 	for _, name := range []string{"AVTransport", "RenderingControl", "ConnectionManager"} {
 		fmt.Fprintf(&services, "<service><serviceType>%s</serviceType><serviceId>urn:upnp-org:serviceId:%s</serviceId><SCPDURL>%s/dlna/%s/scpd.xml</SCPDURL><controlURL>%s/dlna/%s/control</controlURL><eventSubURL>%s/dlna/%s/event</eventSubURL></service>", serviceTypes[name], name, escape(prefix), name, escape(prefix), name, escape(prefix), name)
 	}
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?><root xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0"><specVersion><major>1</major><minor>0</minor></specVersion><URLBase>%s/</URLBase><device><deviceType>%s</deviceType><friendlyName>%s</friendlyName><manufacturer>DyMode</manufacturer><modelName>MiCast Go</modelName><modelNumber>%s</modelNumber><dlna:X_DLNADOC>DMR-1.50</dlna:X_DLNADOC><UDN>%s</UDN><serviceList>%s</serviceList></device></root>`, escape(baseURL.Scheme+"://"+baseURL.Host), renderer, escape(s.name), version.Version, s.uuid, services.String())
+	writeXML(w, http.StatusOK, fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?><root xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0"><specVersion><major>1</major><minor>0</minor></specVersion><URLBase>%s/</URLBase><device><deviceType>%s</deviceType><friendlyName>%s</friendlyName><manufacturer>DyMode</manufacturer><modelName>MiCast Go</modelName><modelNumber>%s</modelNumber><dlna:X_DLNADOC>DMR-1.50</dlna:X_DLNADOC><UDN>%s</UDN><serviceList>%s</serviceList></device></root>`, escape(baseURL.Scheme+"://"+baseURL.Host), renderer, escape(name), version.Version, s.uuid, services.String()))
 }
+
+func (s *Server) Rename(name string) { s.mu.Lock(); s.name = name; s.mu.Unlock() }
 func parseSOAP(r io.Reader) (string, map[string]string, error) {
 	decoder := xml.NewDecoder(r)
 	args := map[string]string{}
@@ -171,10 +201,18 @@ func parseSOAP(r io.Reader) (string, map[string]string, error) {
 		}
 	}
 }
+
+// XML responses use a finite Content-Length, including large DIDL metadata in
+// GetPositionInfo and GetMediaInfo replies.
+func writeXML(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", `text/xml; charset="utf-8"`)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	io.WriteString(w, body)
+}
+
 func fault(w http.ResponseWriter, code int, text string) {
-	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	w.WriteHeader(500)
-	fmt.Fprintf(w, `<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>%d</errorCode><errorDescription>%s</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`, code, escape(text))
+	writeXML(w, 500, fmt.Sprintf(`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>%d</errorCode><errorDescription>%s</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`, code, escape(text)))
 }
 func (s *Server) control(w http.ResponseWriter, r *http.Request, service string) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
@@ -200,179 +238,322 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request, service string)
 	}
 	args["_advance_next"] = r.Header.Get("X-MiCast-Play-Next")
 	response, err := s.action(r.Context(), service, action, args)
+	code := http.StatusOK
+	if err != nil {
+		code = http.StatusInternalServerError
+	}
+	s.recordProtocol(service, action, code, response)
 	if err != nil {
 		fault(w, 701, err.Error())
 		return
 	}
-	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:%sResponse xmlns:u="%s">`, action, serviceTypes[service])
+	var body strings.Builder
+	fmt.Fprintf(&body, `<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:%sResponse xmlns:u="%s">`, action, serviceTypes[service])
 	for _, argument := range actions[service][action] {
 		parts := strings.Split(argument, ":")
 		if parts[1] != "out" {
 			continue
 		}
 		key := parts[0]
-		fmt.Fprintf(w, "<%s>%s</%s>", key, escape(response[key]), key)
+		fmt.Fprintf(&body, "<%s>%s</%s>", key, escape(response[key]), key)
 	}
-	fmt.Fprintf(w, "</u:%sResponse></s:Body></s:Envelope>", action)
+	fmt.Fprintf(&body, "</u:%sResponse></s:Body></s:Envelope>", action)
+	writeXML(w, http.StatusOK, body.String())
 }
 func (s *Server) action(ctx context.Context, service, action string, args map[string]string) (map[string]string, error) {
-	response := map[string]string{}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	status := s.engine.Status()
-	ours := s.owner != "" && status.SessionID == s.owner && status.Protocol == "dlna"
-	state := "STOPPED"
-	if ours {
-		switch status.State {
-		case "playing":
-			state = "PLAYING"
-		case "paused":
-			state = "PAUSED_PLAYBACK"
-		case "transitioning", "waiting_for_speakers":
-			state = "TRANSITIONING"
-		}
+	switch service {
+	case "AVTransport":
+		return s.avTransport(ctx, action, args)
+	case "RenderingControl":
+		return s.renderingControl(ctx, action, args)
+	default:
+		return s.connectionManager(action)
 	}
+}
+
+func (s *Server) avTransport(ctx context.Context, action string, args map[string]string) (map[string]string, error) {
 	switch action {
 	case "SetAVTransportURI":
-		raw := strings.TrimSpace(args["CurrentURI"])
-		if raw == "" || !validURI(raw) {
-			return nil, errors.New("Invalid media URI")
-		}
-		if ours {
-			s.engine.Stop(s.owner)
-		}
-		s.uri = raw
-		s.metadata = args["CurrentURIMetaData"]
-		s.track = metadata(s.metadata)
-		s.owner = ""
-		s.nextURI, s.nextMetadata = "", ""
+		return s.setURI(args)
 	case "SetNextAVTransportURI":
-		raw := strings.TrimSpace(args["NextURI"])
-		if raw != "" && !validURI(raw) {
-			return nil, errors.New("Invalid media URI")
-		}
-		s.nextURI = raw
-		s.nextMetadata = args["NextURIMetaData"]
+		return s.setNext(args)
 	case "Next":
-		if err := s.nextLocked(); err != nil {
-			return nil, err
-		}
+		return s.promote()
 	case "Play":
-		if s.nextURI != "" && (args["_advance_next"] == "1" || (ours && status.Finished)) {
-			if err := s.nextLocked(); err != nil {
-				return nil, err
-			}
-			break
-		}
-		if s.uri == "" {
-			return nil, errors.New("No media")
-		}
 		if args["Speed"] != "" && args["Speed"] != "1" {
 			return nil, errors.New("Unsupported speed")
 		}
-		if state == "PAUSED_PLAYBACK" {
-			if err := s.engine.Resume(ctx); err != nil {
-				return nil, err
-			}
-			s.owner = s.engine.Status().SessionID
-		} else if state != "PLAYING" {
-			id, err := s.engine.PlayMedia(s.uri, s.track, 0)
-			if err != nil {
-				return nil, err
-			}
-			s.owner = id
+		if args["_advance_next"] == "1" {
+			return s.promote()
 		}
+		return s.play()
 	case "Pause":
-		if !ours {
-			return nil, errors.New("No active media")
-		}
-		if err := s.engine.Pause(ctx); err != nil {
-			return nil, err
-		}
+		return s.pause()
 	case "Stop":
-		if ours {
-			s.engine.Stop(s.owner)
-		}
-		s.owner = ""
+		return s.stop(), nil
 	case "Seek":
-		if !ours || args["Unit"] != "REL_TIME" {
-			return nil, errors.New("Seek not available")
-		}
-		position, err := parseTime(args["Target"])
-		if err != nil {
-			return nil, err
-		}
-		if err = s.engine.Seek(position); err != nil {
-			return nil, err
-		}
-		s.owner = s.engine.Status().SessionID
+		return s.seek(args)
 	case "GetTransportInfo":
-		response = map[string]string{"CurrentTransportState": state, "CurrentTransportStatus": "OK", "CurrentSpeed": "1"}
-		if ours && status.State == "error" {
-			response["CurrentTransportStatus"] = "ERROR_OCCURRED"
-		}
+		snap := s.snapshot()
+		return map[string]string{"CurrentTransportState": snap.State, "CurrentTransportStatus": snap.Status, "CurrentSpeed": "1"}, nil
 	case "GetPositionInfo":
-		position := 0.0
-		if ours {
-			position = status.Position
+		snap := s.snapshot()
+		track := "0"
+		if snap.HasMedia {
+			track = "1"
 		}
-		response = map[string]string{"Track": "1", "TrackDuration": formatTime(s.track.Duration), "TrackMetaData": s.metadata, "TrackURI": s.uri, "RelTime": formatTime(position), "AbsTime": formatTime(position), "RelCount": "2147483647", "AbsCount": "2147483647"}
+		return map[string]string{"Track": track, "TrackDuration": formatTime(snap.Duration), "TrackMetaData": snap.Current.Metadata, "TrackURI": snap.Current.URI, "RelTime": formatTime(snap.Position), "AbsTime": formatTime(snap.Position), "RelCount": "0", "AbsCount": "0"}, nil
 	case "GetMediaInfo":
-		response = map[string]string{"NrTracks": "1", "MediaDuration": formatTime(s.track.Duration), "CurrentURI": s.uri, "CurrentURIMetaData": s.metadata, "NextURI": s.nextURI, "NextURIMetaData": s.nextMetadata, "PlayMedium": "NETWORK", "RecordMedium": "NOT_IMPLEMENTED", "WriteStatus": "NOT_IMPLEMENTED"}
-	case "GetDeviceCapabilities":
-		response = map[string]string{"PlayMedia": "NETWORK", "RecMedia": "NOT_IMPLEMENTED", "RecQualityModes": "NOT_IMPLEMENTED"}
-	case "GetTransportSettings":
-		response = map[string]string{"PlayMode": "NORMAL", "RecQualityMode": "NOT_IMPLEMENTED"}
-	case "GetCurrentTransportActions":
-		response["Actions"] = "Play,Pause,Stop,Seek"
-		if s.nextURI != "" {
-			response["Actions"] += ",Next"
+		snap := s.snapshot()
+		tracks := "0"
+		if snap.HasMedia {
+			tracks = "1"
 		}
+		return map[string]string{"NrTracks": tracks, "MediaDuration": formatTime(snap.Duration), "CurrentURI": snap.Current.URI, "CurrentURIMetaData": snap.Current.Metadata, "NextURI": snap.Next.URI, "NextURIMetaData": snap.Next.Metadata, "PlayMedium": "NETWORK", "RecordMedium": "NOT_IMPLEMENTED", "WriteStatus": "NOT_IMPLEMENTED"}, nil
+	case "GetDeviceCapabilities":
+		return map[string]string{"PlayMedia": "NETWORK", "RecMedia": "NOT_IMPLEMENTED", "RecQualityModes": "NOT_IMPLEMENTED"}, nil
+	case "GetTransportSettings":
+		return map[string]string{"PlayMode": "NORMAL", "RecQualityMode": "NOT_IMPLEMENTED"}, nil
+	case "GetCurrentTransportActions":
+		return map[string]string{"Actions": s.snapshot().Actions}, nil
+	default:
+		return nil, errors.New("Invalid Action")
+	}
+}
+
+func (s *Server) renderingControl(ctx context.Context, action string, args map[string]string) (map[string]string, error) {
+	owner := s.currentOwner()
+	switch action {
 	case "GetVolume":
-		response["CurrentVolume"] = strconv.Itoa(s.volume)
+		volume, _ := s.engine.VolumeState()
+		return map[string]string{"CurrentVolume": strconv.Itoa(volume)}, nil
 	case "SetVolume":
 		volume, err := strconv.Atoi(args["DesiredVolume"])
 		if err != nil || volume < 0 || volume > 100 {
 			return nil, errors.New("Invalid volume")
 		}
-		if !s.muted {
-			if err = s.engine.Volume(ctx, volume); err != nil {
-				return nil, err
-			}
-		} else {
-			s.beforeMute = volume
+		if err = s.engine.ProtocolVolume(ctx, volume, "dlna", owner); err != nil {
+			return nil, err
 		}
-		s.volume = volume
 	case "GetMute":
-		response["CurrentMute"] = "0"
-		if s.muted {
-			response["CurrentMute"] = "1"
+		_, muted := s.engine.VolumeState()
+		if muted {
+			return map[string]string{"CurrentMute": "1"}, nil
 		}
+		return map[string]string{"CurrentMute": "0"}, nil
 	case "SetMute":
 		mute := args["DesiredMute"] == "1" || strings.EqualFold(args["DesiredMute"], "true")
-		if mute && !s.muted {
-			s.beforeMute = s.volume
-			if err := s.engine.Volume(ctx, 0); err != nil {
-				return nil, err
-			}
-		} else if !mute && s.muted {
-			if err := s.engine.Volume(ctx, s.beforeMute); err != nil {
-				return nil, err
-			}
-			s.volume = s.beforeMute
+		if err := s.engine.ProtocolMute(ctx, mute, "dlna", owner); err != nil {
+			return nil, err
 		}
-		s.muted = mute
-	case "GetProtocolInfo":
-		response = map[string]string{"Source": "", "Sink": protocols}
-	case "GetCurrentConnectionIDs":
-		response["ConnectionIDs"] = "0"
-	case "GetCurrentConnectionInfo":
-		response = map[string]string{"RcsID": "0", "AVTransportID": "0", "ProtocolInfo": "", "PeerConnectionManager": "", "PeerConnectionID": "-1", "Direction": "Input", "Status": "OK"}
 	default:
 		return nil, errors.New("Invalid Action")
 	}
-	return response, nil
+	return map[string]string{}, nil
+}
+
+func (s *Server) connectionManager(action string) (map[string]string, error) {
+	switch action {
+	case "GetProtocolInfo":
+		return map[string]string{"Source": "", "Sink": protocols}, nil
+	case "GetCurrentConnectionIDs":
+		return map[string]string{"ConnectionIDs": "0"}, nil
+	case "GetCurrentConnectionInfo":
+		return map[string]string{"RcsID": "0", "AVTransportID": "0", "ProtocolInfo": "", "PeerConnectionManager": "", "PeerConnectionID": "-1", "Direction": "Input", "Status": "OK"}, nil
+	default:
+		return nil, errors.New("Invalid Action")
+	}
+}
+
+func (s *Server) currentOwner() string {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.owner
+}
+
+func (s *Server) setURI(args map[string]string) (map[string]string, error) {
+	raw := strings.TrimSpace(args["CurrentURI"])
+	if raw == "" || !validURI(raw) {
+		return nil, errors.New("Invalid media URI")
+	}
+	meta := args["CurrentURIMetaData"]
+	track := metadata(meta, raw)
+	s.stateMu.Lock()
+	oldOwner := s.owner
+	s.cast++
+	s.trackID++
+	s.uri, s.metadata, s.track = raw, meta, track
+	s.nextURI, s.nextMetadata, s.nextTrack = "", "", playback.Track{}
+	s.owner, s.engineTrackID = "", ""
+	s.desired, s.lastError = "STOPPED", ""
+	s.positionBase, s.pendingStarts = 0, 0
+	s.stateMu.Unlock()
+	// Stop the old audio immediately; the next Play establishes the new
+	// source. This never waits on the cloud, so the SOAP reply stays fast.
+	s.engine.Preempt(oldOwner)
+	return map[string]string{"_duration": formatTime(track.Duration), "_meta": metaPresence(meta)}, nil
+}
+
+func (s *Server) setNext(args map[string]string) (map[string]string, error) {
+	raw := strings.TrimSpace(args["NextURI"])
+	if raw != "" && !validURI(raw) {
+		return nil, errors.New("Invalid media URI")
+	}
+	meta := args["NextURIMetaData"]
+	nextTrack := playback.Track{}
+	if raw != "" {
+		nextTrack = metadata(meta, raw)
+	}
+	s.stateMu.Lock()
+	if raw == "" {
+		s.nextURI, s.nextMetadata, s.nextTrack = "", "", playback.Track{}
+	} else {
+		s.nextURI, s.nextMetadata, s.nextTrack = raw, meta, nextTrack
+	}
+	owner, cast := s.owner, s.cast
+	s.stateMu.Unlock()
+	if raw != "" && owner != "" {
+		s.enqueue(job{kind: jobPrefetch, cast: cast, owner: owner, uri: raw})
+	}
+	s.advanceLocked(s.engine.Status())
+	return map[string]string{"_duration": formatTime(nextTrack.Duration), "_meta": metaPresence(meta)}, nil
+}
+
+func (s *Server) play() (map[string]string, error) {
+	s.stateMu.Lock()
+	status := s.engine.Status()
+	if s.uri == "" {
+		s.stateMu.Unlock()
+		return nil, errors.New("No media")
+	}
+	owner := s.owner
+	ours := owner != "" && status.SessionID == owner && status.Protocol == "dlna"
+	// A controller may send Play after the media already ended while its
+	// pre-supplied Next is still queued. Promote instead of replaying.
+	if ours && status.Finished && s.nextURI != "" {
+		s.stateMu.Unlock()
+		return s.promote()
+	}
+	if s.pendingStarts > 0 && s.desired == "PLAYING" {
+		s.stateMu.Unlock()
+		return map[string]string{}, nil
+	}
+	switch {
+	case ours && status.State == "playing":
+		s.desired = "PLAYING"
+		s.stateMu.Unlock()
+		return map[string]string{}, nil
+	case ours && status.State == "paused":
+		s.desired = "PLAYING"
+		cast, track := s.cast, s.trackID
+		s.stateMu.Unlock()
+		s.enqueue(job{kind: jobResume, cast: cast, track: track, owner: owner})
+		return map[string]string{}, nil
+	case ours && (status.State == "transitioning" || status.State == "waiting_for_speakers"):
+		s.desired = "PLAYING"
+		s.stateMu.Unlock()
+		return map[string]string{}, nil
+	}
+	uri, track, cast, trackID := s.uri, s.track, s.cast, s.trackID
+	position := s.positionBase
+	startOwner := ""
+	if ours {
+		startOwner = owner
+	}
+	s.desired = "PLAYING"
+	s.owner, s.engineTrackID = "", ""
+	s.pendingStarts++
+	s.stateMu.Unlock()
+	s.submit(job{kind: jobStart, cast: cast, track: trackID, seq: s.engine.Sequence(), owner: startOwner, uri: uri, info: track, position: position})
+	return map[string]string{}, nil
+}
+
+func (s *Server) pause() (map[string]string, error) {
+	s.stateMu.Lock()
+	status := s.engine.Status()
+	owner := s.owner
+	if owner == "" || status.SessionID != owner || status.Protocol != "dlna" {
+		s.stateMu.Unlock()
+		return nil, errors.New("No active media")
+	}
+	s.desired = "PAUSED_PLAYBACK"
+	cast, track := s.cast, s.trackID
+	s.stateMu.Unlock()
+	if status.State == "paused" {
+		return map[string]string{}, nil
+	}
+	s.enqueue(job{kind: jobPause, cast: cast, track: track, owner: owner})
+	return map[string]string{}, nil
+}
+
+func (s *Server) stop() map[string]string {
+	s.stateMu.Lock()
+	owner := s.owner
+	s.cast++
+	s.nextURI, s.nextMetadata, s.nextTrack = "", "", playback.Track{}
+	s.desired, s.lastError = "STOPPED", ""
+	s.owner, s.engineTrackID = "", ""
+	s.positionBase, s.pendingStarts = 0, 0
+	s.stateMu.Unlock()
+	s.engine.Preempt(owner)
+	return map[string]string{}
+}
+
+func (s *Server) seek(args map[string]string) (map[string]string, error) {
+	if args["Unit"] != "REL_TIME" {
+		return nil, errors.New("Seek not available")
+	}
+	position, err := parseTime(args["Target"])
+	if err != nil {
+		return nil, err
+	}
+	s.stateMu.Lock()
+	status := s.engine.Status()
+	owner := s.owner
+	if owner == "" || status.SessionID != owner || status.Protocol != "dlna" {
+		s.stateMu.Unlock()
+		return nil, errors.New("Seek not available")
+	}
+	s.positionBase = position
+	cast, track := s.cast, s.trackID
+	s.stateMu.Unlock()
+	s.enqueue(job{kind: jobSeek, cast: cast, track: track, owner: owner, position: position})
+	return map[string]string{}, nil
+}
+
+// promote starts the queued track immediately, used by the explicit Next
+// action and by Play when a controller asks for the next item.
+func (s *Server) promote() (map[string]string, error) {
+	s.stateMu.Lock()
+	status := s.engine.Status()
+	if s.nextURI == "" {
+		s.stateMu.Unlock()
+		return nil, errors.New("No queued media URI")
+	}
+	owner := s.owner
+	uri, meta, track := s.nextURI, s.nextMetadata, s.nextTrack
+	s.trackID++
+	s.uri, s.metadata, s.track = uri, meta, track
+	s.nextURI, s.nextMetadata, s.nextTrack = "", "", playback.Track{}
+	s.owner, s.engineTrackID = "", ""
+	s.desired, s.positionBase = "PLAYING", 0
+	s.pendingStarts++
+	j := job{kind: jobStart, cast: s.cast, track: s.trackID, seq: s.engine.Sequence(), owner: owner, uri: uri, info: track}
+	if owner != "" && status.Finished && status.SessionID == owner && status.Protocol == "dlna" {
+		j.kind, j.continuation = jobAdvance, true
+	}
+	s.stateMu.Unlock()
+	s.submit(j)
+	return map[string]string{"_duration": formatTime(track.Duration), "_meta": metaPresence(meta)}, nil
+}
+
+// Polling and LastChange events describe the same snapshot. A natural end
+// remains STOPPED until the controller provides more media; subscription
+// expiry or silence from the controller never implies Stop.
+func (s *Server) transportState(status playback.Status) string {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.stateLocked(status)
 }
 func validURI(raw string) bool {
 	u, err := url.Parse(raw)
@@ -382,38 +563,65 @@ func validURI(raw string) bool {
 	ip := net.ParseIP(u.Hostname())
 	return ip == nil || (!ip.IsLoopback() && !ip.IsLinkLocalUnicast() && ip.IsGlobalUnicast())
 }
-func metadata(raw string) playback.Track {
+
+type didlResource struct {
+	uri      string
+	duration float64
+}
+
+func metadata(raw, currentURI string) playback.Track {
 	var result playback.Track
+	var resources []didlResource
 	decoder := xml.NewDecoder(strings.NewReader(raw))
 	for {
 		token, err := decoder.Token()
 		if err != nil {
 			break
 		}
-		if start, ok := token.(xml.StartElement); ok {
+		start, ok := token.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		switch start.Name.Local {
+		case "title", "artist", "creator", "album":
+			var text string
+			decoder.DecodeElement(&text, &start)
 			switch start.Name.Local {
-			case "title", "artist", "creator", "album":
-				var text string
-				decoder.DecodeElement(&text, &start)
-				switch start.Name.Local {
-				case "title":
-					result.Title = text
-				case "artist":
+			case "title":
+				result.Title = text
+			case "artist":
+				result.Artist = text
+			case "creator":
+				if result.Artist == "" {
 					result.Artist = text
-				case "creator":
-					if result.Artist == "" {
-						result.Artist = text
-					}
-				case "album":
-					result.Album = text
 				}
-			case "res":
-				for _, a := range start.Attr {
-					if a.Name.Local == "duration" {
-						result.Duration, _ = parseTime(a.Value)
-					}
+			case "album":
+				result.Album = text
+			}
+		case "res":
+			duration := 0.0
+			for _, a := range start.Attr {
+				if a.Name.Local == "duration" {
+					duration, _ = parseTime(a.Value)
 				}
 			}
+			var text string
+			decoder.DecodeElement(&text, &start)
+			resources = append(resources, didlResource{uri: strings.TrimSpace(text), duration: duration})
+		}
+	}
+	// A DIDL item may list several resources. Duration belongs to the
+	// resource that the controller actually selected, not the last one.
+	for _, resource := range resources {
+		if resource.uri != "" && resource.uri == currentURI {
+			result.Duration = resource.duration
+			return result
+		}
+	}
+	for _, resource := range resources {
+		if resource.duration > 0 {
+			result.Duration = resource.duration
+			break
 		}
 	}
 	return result
@@ -436,22 +644,25 @@ func formatTime(seconds float64) string {
 	return fmt.Sprintf("%02d:%02d:%02d", n/3600, n/60%60, n%60)
 }
 
-// nextLocked preserves queued metadata until a new session can be created.
-func (s *Server) nextLocked() error {
-	if s.nextURI == "" {
-		return errors.New("No queued media URI")
+func metaPresence(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return "empty"
 	}
-	track := metadata(s.nextMetadata)
-	id, err := s.engine.PlayMedia(s.nextURI, track, 0, true)
-	if err != nil {
-		return err
-	}
-	s.uri, s.metadata, s.track, s.owner = s.nextURI, s.nextMetadata, track, id
-	s.nextURI, s.nextMetadata = "", ""
-	return nil
+	return "present"
 }
-func (s *Server) advanceLocked(status playback.Status) {
-	if status.Finished && status.Protocol == "dlna" && status.SessionID == s.owner && s.nextURI != "" {
-		_ = s.nextLocked()
+
+// Playback completion drives the queue independently of UPnP subscriptions.
+// Promotion happens in the protocol snapshot; the engine work is queued.
+func (s *Server) lifecycle() {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.engine.Changes():
+			if s.ctx.Err() == nil {
+				s.advanceLocked(s.engine.Status())
+			}
+		}
 	}
 }

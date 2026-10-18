@@ -16,6 +16,36 @@ import (
 	"time"
 )
 
+func TestNaturalCompletionWaitsForPausedPlayback(t *testing.T) {
+	a, _ := testsupport.NewApp(t, "wav")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e := &Engine{ctx: ctx, app: a}
+	s := e.newSession("dlna", Track{}, 0)
+	s.frames = 4410
+	s.playbackStart = time.Now().Add(-time.Second)
+	s.state = "paused"
+	s.pausedAt = time.Now()
+	done := make(chan struct{})
+	go func() { defer close(done); e.finishMedia(s) }()
+	select {
+	case <-done:
+		t.Fatal("paused EOF advanced playback")
+	case <-time.After(200 * time.Millisecond):
+	}
+	s.mu.Lock()
+	s.state = "playing"
+	s.mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("natural completion did not finish")
+	}
+	if status := e.Status(); !status.Finished || status.State != "stopped" {
+		t.Fatal("completion unavailable to DLNA queue", status)
+	}
+}
+
 func TestFiniteMediaWaitsForSpeakerAndReusesCache(t *testing.T) {
 	ffmpeg, err := exec.LookPath("ffmpeg")
 	if err != nil {
@@ -227,5 +257,68 @@ func TestNaturalCompletionIsDistinctFromUserStop(t *testing.T) {
 	e.Stop(s.id)
 	if e.Status().Finished {
 		t.Fatal("manual stop treated as queue completion")
+	}
+}
+
+// Some renderers close their request at the track boundary rather than waiting
+// for the HTTP handler to observe EOF. That must not discard the DLNA queue.
+func TestNaturalCompletionAfterRendererClosesAtTrackBoundary(t *testing.T) {
+	a, _ := testsupport.NewApp(t, "wav")
+	e := &Engine{ctx: context.Background(), app: a, changes: make(chan struct{}, 1)}
+	t.Cleanup(e.Close)
+	s := e.newSession("dlna", Track{}, 0)
+	s.frames = 4410
+	s.sourceEnded = true
+	s.playbackStart = time.Now().Add(-time.Second)
+	s.state = "playing"
+	s.pulls["speaker"] = Pull{Bytes: 4410 * 4, Connections: 0, Completed: false}
+	done := make(chan struct{})
+	go func() { defer close(done); e.finishMedia(s) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		e.Stop(s.id)
+		<-done
+		t.Fatal("closed renderer request prevented natural completion")
+	}
+	if status := e.Status(); !status.Finished || status.EndReason != "media_finished" {
+		t.Fatal("track boundary was treated as failure", status)
+	}
+	if _, err := e.AdvanceMedia(s.identity, "http://127.0.0.1:1/next.wav", Track{}); err != nil {
+		t.Fatal("queue could not advance after renderer closed", err)
+	}
+}
+
+func TestNaturalCompletionStillWaitsForActiveRendererRequest(t *testing.T) {
+	a, _ := testsupport.NewApp(t, "wav")
+	e := &Engine{ctx: context.Background(), app: a}
+	t.Cleanup(e.Close)
+	s := e.newSession("dlna", Track{}, 0)
+	s.frames = 4410
+	s.sourceEnded = true
+	s.playbackStart = time.Now().Add(-time.Second)
+	s.state = "playing"
+	s.pulls["speaker"] = Pull{Bytes: 1024, Connections: 1}
+	done := make(chan struct{})
+	go func() { defer close(done); e.finishMedia(s) }()
+	select {
+	case <-done:
+		t.Fatal("active request was cut off")
+	case <-time.After(200 * time.Millisecond):
+	}
+	s.mu.Lock()
+	p := s.pulls["speaker"]
+	p.Connections = 0
+	s.pulls["speaker"] = p
+	s.mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		e.Stop(s.id)
+		<-done
+		t.Fatal("closed request still blocked completion")
+	}
+	if !e.Status().Finished {
+		t.Fatal("not a natural completion")
 	}
 }

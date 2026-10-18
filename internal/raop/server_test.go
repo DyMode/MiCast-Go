@@ -134,6 +134,36 @@ func TestTimingReply(t *testing.T) {
 		t.Fatal("invalid timing reply")
 	}
 }
+
+func TestRepeatedRecordReusesStreamAndSupersededRecordCannotReclaim(t *testing.T) {
+	a, _ := testsupport.NewApp(t, "wav")
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	e, err := playback.New(ctx, a, binary, "http://renderer", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(e.Close)
+	s := &session{server: &Server{engine: e}, ctx: ctx, audio: &net.UDPConn{}}
+	if err := s.record(); err != nil {
+		t.Fatal(err)
+	}
+	firstQueue, firstOwner := s.queue, s.owner
+	if err := s.record(); err != nil || s.queue != firstQueue || s.owner != firstOwner {
+		t.Fatal("repeated RECORD replaced the PCM stream", err)
+	}
+	q := playback.NewPCMQueue(ctx)
+	newOwner, err := e.StartPCM(q, playback.Track{Title: "new sender"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.record() == nil || e.Status().SessionID != newOwner {
+		t.Fatal("superseded connection reclaimed playback")
+	}
+}
 func TestAirPlayRTSPAndUDPAudioReachHTTPStream(t *testing.T) {
 	ffmpeg, err := exec.LookPath("ffmpeg")
 	if err != nil {
@@ -193,6 +223,12 @@ func TestAirPlayRTSPAndUDPAudioReachHTTPStream(t *testing.T) {
 		t.Fatal("missing server UDP port")
 	}
 	send("RECORD", "", "")
+	firstSession := engine.Status().SessionID
+	send("FLUSH", "", "")
+	send("RECORD", "", "")
+	if after := engine.Status().SessionID; after != firstSession {
+		t.Fatalf("track boundary restarted playback: %s -> %s", firstSession, after)
+	}
 	udp, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
 	if err != nil {
 		t.Fatal(err)

@@ -15,6 +15,7 @@ import (
 	alac "github.com/mycophonic/saprobe-alac"
 	"io"
 	"log/slog"
+	"math"
 	"micastgo/internal/netutil"
 	"micastgo/internal/playback"
 	"net"
@@ -25,16 +26,18 @@ import (
 )
 
 type Server struct {
-	listener net.Listener
-	service  *zeroconf.Server
-	engine   *playback.Engine
-	key      *rsa.PrivateKey
-	mac      []byte
-	ctx      context.Context
-	cancel   context.CancelFunc
-	mu       sync.Mutex
-	clients  map[net.Conn]bool
-	wg       sync.WaitGroup
+	listener  net.Listener
+	service   *zeroconf.Server
+	engine    *playback.Engine
+	key       *rsa.PrivateKey
+	mac       []byte
+	ctx       context.Context
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	clients   map[net.Conn]bool
+	wg        sync.WaitGroup
+	serviceMu sync.Mutex
+	register  func(string) (*zeroconf.Server, error)
 }
 
 func Start(ctx context.Context, engine *playback.Engine, name, host, address string, announce bool, identity ...string) (*Server, error) {
@@ -57,8 +60,11 @@ func Start(ctx context.Context, engine *playback.Engine, name, host, address str
 	s := &Server{listener: listener, engine: engine, key: key, mac: mac, ctx: ctx, cancel: cancel, clients: map[net.Conn]bool{}}
 	if announce {
 		port := listener.Addr().(*net.TCPAddr).Port
-		instance := strings.ToUpper(hex.EncodeToString(mac)) + "@" + name
-		s.service, err = zeroconf.RegisterProxy(instance, "_raop._tcp", "local.", port, "micast-go-"+hex.EncodeToString(mac)+".local.", []string{host}, []string{"txtvers=1", "ch=2", "cn=0,1", "da=true", "et=0,1", "am=MiCastGo1,1", "md=0,1,2", "pw=false", "sr=44100", "ss=16", "sv=false", "sf=0x4", "tp=UDP", "vn=3", "vs=105.1"}, nil)
+		s.register = func(name string) (*zeroconf.Server, error) {
+			instance := strings.ToUpper(hex.EncodeToString(mac)) + "@" + name
+			return zeroconf.RegisterProxy(instance, "_raop._tcp", "local.", port, "micast-go-"+hex.EncodeToString(mac)+".local.", []string{host}, []string{"txtvers=1", "ch=2", "cn=0,1", "da=true", "et=0,1", "am=MiCastGo1,1", "md=0,1,2", "pw=false", "sr=44100", "ss=16", "sv=false", "sf=0x4", "tp=UDP", "vn=3", "vs=105.1"}, nil)
+		}
+		s.service, err = s.register(name)
 		if err != nil {
 			listener.Close()
 			cancel()
@@ -71,6 +77,8 @@ func Start(ctx context.Context, engine *playback.Engine, name, host, address str
 }
 func (s *Server) Addr() net.Addr { return s.listener.Addr() }
 func (s *Server) Close() {
+	s.serviceMu.Lock()
+	defer s.serviceMu.Unlock()
 	s.cancel()
 	s.listener.Close()
 	s.mu.Lock()
@@ -82,6 +90,25 @@ func (s *Server) Close() {
 		s.service.Shutdown()
 	}
 	s.wg.Wait()
+}
+
+// Renaming discovery never closes an active RTSP transport or PCM source.
+func (s *Server) Rename(name string) error {
+	s.serviceMu.Lock()
+	defer s.serviceMu.Unlock()
+	if s.ctx.Err() != nil {
+		return s.ctx.Err()
+	}
+	if s.register == nil {
+		return nil
+	}
+	if s.service != nil {
+		s.service.Shutdown()
+		s.service = nil
+	}
+	var err error
+	s.service, err = s.register(name)
+	return err
 }
 func (s *Server) serve() {
 	defer s.wg.Done()
@@ -171,7 +198,45 @@ func writeResponse(c net.Conn, r request, status int, headers map[string]string,
 }
 func (s *Server) client(conn net.Conn) {
 	sess := &session{server: s, conn: conn, pending: map[uint16][]byte{}}
-	defer sess.close()
+	clientCtx, cancelClient := context.WithCancel(s.ctx)
+	var commands sync.WaitGroup
+	type volumeUpdate struct {
+		owner   string
+		percent int
+	}
+	volumeUpdates := make(chan volumeUpdate, 1)
+	commands.Add(1)
+	go func() {
+		defer commands.Done()
+		for {
+			var update volumeUpdate
+			select {
+			case <-clientCtx.Done():
+				return
+			case update = <-volumeUpdates:
+			}
+			timer := time.NewTimer(50 * time.Millisecond)
+		collect:
+			for {
+				select {
+				case <-clientCtx.Done():
+					timer.Stop()
+					return
+				case update = <-volumeUpdates:
+				case <-timer.C:
+					break collect
+				}
+			}
+			ctx, cancel := context.WithTimeout(clientCtx, 8*time.Second)
+			_ = s.engine.Volume(ctx, update.percent, update.owner)
+			cancel()
+		}
+	}()
+	defer func() {
+		cancelClient()
+		commands.Wait()
+		sess.close()
+	}()
 	reader := bufio.NewReaderSize(conn, 32768)
 	for {
 		conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
@@ -221,7 +286,7 @@ func (s *Server) client(conn net.Conn) {
 			// session here resets the encoder and makes every speaker reconnect.
 		case "PAUSE":
 			ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-			_ = s.engine.Pause(ctx)
+			_ = s.engine.Pause(ctx, sess.owner)
 			cancel()
 		case "SET_PARAMETER":
 			if strings.Contains(r.headers["content-type"], "x-dmap-tagged") {
@@ -231,17 +296,26 @@ func (s *Server) client(conn net.Conn) {
 				for _, line := range strings.Split(string(r.body), "\n") {
 					if raw, ok := strings.CutPrefix(strings.TrimSpace(line), "volume:"); ok {
 						db, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
-						if err == nil {
-							percent := int((db + 30) / 30 * 100)
+						if err == nil && !math.IsNaN(db) && !math.IsInf(db, 0) {
+							percent := int(math.Round((max(-30, min(0, db)) + 30) / 30 * 100))
 							if db <= -144 {
 								percent = 0
 							}
 							percent = max(0, min(100, percent))
-							go func() {
-								ctx, cancel := context.WithTimeout(s.ctx, 8*time.Second)
-								defer cancel()
-								_ = s.engine.Volume(ctx, percent)
-							}()
+							// Initial volume often arrives before RECORD. Retain it
+							// on this connection without touching another cast.
+							sess.mu.Lock()
+							sess.volume = &percent
+							owner := sess.owner
+							sess.mu.Unlock()
+							if owner == "" {
+								continue
+							}
+							select {
+							case <-volumeUpdates:
+							default:
+							}
+							volumeUpdates <- volumeUpdate{owner: owner, percent: percent}
 						}
 					}
 				}
@@ -249,7 +323,20 @@ func (s *Server) client(conn net.Conn) {
 		case "GET_PARAMETER":
 			headers["Content-Type"] = "text/parameters"
 			if strings.Contains(string(r.body), "volume") {
-				body = []byte("volume: -10.000000\r\n")
+				volume, muted := s.engine.VolumeState()
+				db := float64(volume)*30/100 - 30
+				if volume == 0 || muted {
+					db = -144
+				}
+				sess.mu.Lock()
+				if sess.owner == "" && sess.volume != nil {
+					db = float64(*sess.volume)*30/100 - 30
+					if *sess.volume == 0 {
+						db = -144
+					}
+				}
+				sess.mu.Unlock()
+				body = []byte(fmt.Sprintf("volume: %.6f\r\n", db))
 			}
 		case "TEARDOWN":
 			_ = writeResponse(conn, r, 200, headers, nil)
@@ -279,6 +366,7 @@ type session struct {
 	cancel                     context.CancelFunc
 	queue                      *playback.PCMQueue
 	owner                      string
+	volume                     *int
 	track                      playback.Track
 	pending                    map[uint16][]byte
 	expected                   uint16
@@ -370,6 +458,14 @@ func (s *session) open(transport string) error {
 		return errors.New("ANNOUNCE required")
 	}
 	s.closeUDP()
+	if s.queue != nil {
+		s.queue.Close()
+		s.queue = nil
+	}
+	if s.owner != "" {
+		s.server.engine.Preempt(s.owner)
+		s.owner = ""
+	}
 	s.ctx, s.cancel = context.WithCancel(s.server.ctx)
 	var err error
 	for _, target := range []**net.UDPConn{&s.audio, &s.control, &s.timing} {
@@ -398,8 +494,27 @@ func (s *session) record() error {
 	if s.audio == nil {
 		return errors.New("SETUP required")
 	}
+	// Senders may repeat RECORD after a track change or FLUSH. Keep the
+	// existing PCM stream so speakers do not reconnect on every song.
+	s.mu.Lock()
+	owner, active := s.owner, s.queue != nil
+	s.mu.Unlock()
+	status := s.server.engine.Status()
+	if owner != "" && status.SessionID != owner {
+		return errors.New("playback session superseded")
+	}
+	if active && status.SessionID == owner && !status.Finished && status.State != "stopped" && status.State != "error" {
+		if status.State == "paused" {
+			return s.server.engine.Resume(s.ctx, owner)
+		}
+		return nil
+	}
 	q := playback.NewPCMQueue(s.ctx)
-	id, err := s.server.engine.StartPCM(q, s.track)
+	var initialVolume []int
+	if s.volume != nil {
+		initialVolume = []int{*s.volume}
+	}
+	id, err := s.server.engine.StartPCMFor(owner, q, s.track, initialVolume...)
 	if err != nil {
 		q.Close()
 		return err
@@ -447,7 +562,7 @@ func (s *session) close() {
 		s.queue.Close()
 	}
 	if s.owner != "" {
-		s.server.engine.Stop(s.owner)
+		s.server.engine.Preempt(s.owner)
 	}
 }
 func (s *session) receive(socket *net.UDPConn, control, timing bool) {
@@ -506,11 +621,13 @@ func (s *session) watch() {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
+			status := s.server.engine.Status()
 			s.mu.Lock()
-			idle := s.queue != nil && time.Since(s.lastRTP) > 15*time.Second
+			idle := s.queue != nil && status.State != "paused" && time.Since(s.lastRTP) > 15*time.Second
+			ended := s.owner != "" && (status.SessionID != s.owner || status.State == "stopped" || status.State == "error")
 			s.drain()
 			s.mu.Unlock()
-			if idle {
+			if idle || ended {
 				s.conn.Close()
 				return
 			}
