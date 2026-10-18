@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -52,9 +53,11 @@ type Device struct {
 	IP       string `json:"address"`
 }
 type Client struct {
-	HTTP        *http.Client
-	AccountBase string
-	MinaBase    string
+	preferenceMu    sync.Mutex
+	playPreferences map[string]bool
+	HTTP            *http.Client
+	AccountBase     string
+	MinaBase        string
 }
 
 func NewClient() *Client {
@@ -255,6 +258,12 @@ func (c *Client) Exchange(ctx context.Context, t Tokens) (Tokens, error) {
 	return t, nil
 }
 func (c *Client) mina(ctx context.Context, t Tokens, path string, form url.Values) (map[string]json.RawMessage, error) {
+	select {
+	case cloudRequests <- struct{}{}:
+		defer func() { <-cloudRequests }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	if t.UserID == "" || t.ServiceToken == "" {
 		return nil, ErrRejected
 	}
@@ -302,15 +311,15 @@ func (c *Client) Command(ctx context.Context, t Tokens, id, method string, messa
 	}
 	var detail map[string]json.RawMessage
 	if json.Unmarshal(m["data"], &detail) == nil && code(detail) != 0 {
-		return fmt.Errorf("音箱未接受指令（code=%s）", str(detail, "code"))
+		return &CommandRejected{Code: str(detail, "code")}
 	}
 	return nil
 }
 
 var musicModels = map[string]bool{"LX04": true, "LX05": true, "L05B": true, "L05C": true, "L06": true, "L06A": true, "X08A": true, "X10A": true, "X08C": true, "X08E": true, "X8F": true, "X4B": true, "OH2": true, "OH2P": true, "X6A": true}
 
-func (c *Client) PlayURL(ctx context.Context, t Tokens, id, hardware, raw, audioID string) error {
-	if !musicModels[hardware] {
+func (c *Client) playURL(ctx context.Context, t Tokens, id, raw, audioID string, musicMethod bool) error {
+	if !musicMethod {
 		return c.Command(ctx, t, id, "player_play_url", map[string]any{"media": "app_ios", "url": raw, "type": 2})
 	}
 	if audioID == "" {

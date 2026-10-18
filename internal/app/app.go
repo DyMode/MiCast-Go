@@ -31,6 +31,9 @@ type QRSession struct {
 	epoch     uint64
 }
 type DeviceState struct {
+	CurrentVolume *int                      `json:"current_volume,omitempty"`
+	Formats       map[string]FormatEvidence `json:"formats,omitempty"`
+	Observed      *Observation              `json:"observed,omitempty"`
 	store.Speaker
 	Discovered   bool   `json:"discovered"`
 	CommandState string `json:"command_state,omitempty"`
@@ -50,6 +53,9 @@ type Snapshot struct {
 	Receivers map[string]string `json:"receivers"`
 }
 type App struct {
+	volumes         map[string]int                       // Protected by mu; latest command/readback, not persisted defaults.
+	formats         map[string]map[string]FormatEvidence // Protected by mu; bounded session evidence.
+	observations    map[string]Observation               // Protected by mu.
 	nextRefresh     time.Time
 	refreshFailures int
 	lastRecovery    time.Time
@@ -58,6 +64,7 @@ type App struct {
 	mu            sync.RWMutex
 	op            sync.Mutex // Orders configuration changes and cloud playback commands.
 	authOp        sync.Mutex // Only one account exchange or QR poll at a time.
+	refreshOp     sync.Mutex // Device fetches do not hold the playback state lock.
 	cloud         Cloud
 	config        *store.ConfigStore
 	vault         *store.Vault
@@ -72,7 +79,9 @@ type App struct {
 	lastRefresh   time.Time
 	nextRenew     time.Time
 	routes        map[string]*routeState // Protected by op.
-	owners        map[string]string      // Physical speaker -> route; protected by op.
+	commandGates  map[string]chan struct{}
+	leases        map[string]*targetLease
+	owners        map[string]string // Physical speaker -> route; protected by op.
 	receivers     map[string]string
 }
 
@@ -96,7 +105,21 @@ func (a *App) Snapshot() Snapshot {
 	c := a.config.Snapshot()
 	devices := []DeviceState{}
 	for id, s := range c.Speakers {
-		devices = append(devices, DeviceState{s, a.discovered[id], a.states[id], a.commandErrors[id]})
+		device := DeviceState{Speaker: s, Discovered: a.discovered[id], CommandState: a.states[id], Error: a.commandErrors[id]}
+		if observation, ok := a.observations[id]; ok && observation.User == a.tokens.UserID {
+			device.Observed = &observation
+		}
+		if evidence := a.formats[a.tokens.UserID+"/"+id]; len(evidence) > 0 {
+			device.Formats = make(map[string]FormatEvidence, len(evidence))
+			for format, value := range evidence {
+				device.Formats[format] = value
+			}
+		}
+		if value, ok := a.volumes[a.tokens.UserID+"/"+id]; ok {
+			v := value
+			device.CurrentVolume = &v
+		}
+		devices = append(devices, device)
 	}
 	sort.Slice(devices, func(i, j int) bool { return devices[i].ID < devices[j].ID })
 	// Stored credentials do not prove cloud connectivity or speaker reachability.
@@ -201,10 +224,7 @@ func (a *App) PollQR(ctx context.Context, id string) (string, error) {
 		a.discovered = map[string]bool{}
 		a.states = map[string]string{}
 		a.commandErrors = map[string]string{}
-		a.routes = map[string]*routeState{}
-		a.ownerMu.Lock()
-		a.owners = map[string]string{}
-		a.ownerMu.Unlock()
+		a.resetRoutesLocked()
 		a.nextRenew = time.Time{}
 	}
 	return status, nil
@@ -225,52 +245,52 @@ func (a *App) Logout() error {
 	a.discovered = map[string]bool{}
 	a.states = map[string]string{}
 	a.commandErrors = map[string]string{}
-	a.routes = map[string]*routeState{}
-	a.ownerMu.Lock()
-	a.owners = map[string]string{}
-	a.ownerMu.Unlock()
+	a.resetRoutesLocked()
 	a.nextRenew = time.Time{}
 	return nil
 }
 func (a *App) Refresh(ctx context.Context, force bool) error {
+	if !a.refreshOp.TryLock() {
+		return nil
+	}
+	defer a.refreshOp.Unlock()
 	a.op.Lock()
-	defer a.op.Unlock()
 	a.mu.RLock()
 	tokens, epoch, last, status := a.tokens, a.epoch, a.lastRefresh, a.status
 	a.mu.RUnlock()
 	if tokens.UserID == "" || status == "expired" {
+		a.op.Unlock()
 		return nil
 	}
 	if !force && (time.Since(last) < 5*time.Minute || time.Now().Before(a.nextRefresh)) {
+		a.op.Unlock()
 		return nil
 	}
+	a.op.Unlock()
 	devices, err := a.cloud.Devices(ctx, tokens)
-	if err != nil && !errors.Is(err, xiaomi.ErrRateLimited) && tokens.PassToken != "" && time.Since(a.lastRecovery) >= time.Minute && a.authOp.TryLock() {
+	a.op.Lock()
+	a.mu.RLock()
+	sameAccount := a.epoch == epoch && a.tokens.UserID == tokens.UserID
+	a.mu.RUnlock()
+	recoverAccount := sameAccount && err != nil && !errors.Is(err, xiaomi.ErrRateLimited) && tokens.PassToken != "" && time.Since(a.lastRecovery) >= time.Minute && a.authOp.TryLock()
+	if recoverAccount {
+		defer a.authOp.Unlock()
 		a.lastRecovery = time.Now()
+	}
+	a.op.Unlock()
+	var recovered *xiaomi.Tokens
+	var rejected error
+	if recoverAccount {
 		next, recoveryErr := a.cloud.Exchange(ctx, tokens)
 		if recoveryErr == nil && next.UserID == tokens.UserID && next.ServiceToken != "" {
-			if saveErr := a.vault.Save(next); saveErr == nil {
-				a.mu.Lock()
-				a.tokens = next
-				a.mu.Unlock()
-				tokens = next
-				devices, err = a.cloud.Devices(ctx, tokens)
-			} else {
-				err = saveErr
-			}
+			recovered = &next
+			devices, err = a.cloud.Devices(ctx, next)
 		} else if errors.Is(recoveryErr, xiaomi.ErrRejected) {
-			a.mu.Lock()
-			a.tokens.Rejected = true
-			a.status = "expired"
-			a.lastError = recoveryErr.Error()
-			_ = a.vault.Save(a.tokens)
-			a.mu.Unlock()
-			a.authOp.Unlock()
-			return recoveryErr
+			rejected = recoveryErr
 		}
-		a.authOp.Unlock()
 	}
-
+	a.op.Lock()
+	defer a.op.Unlock()
 	before := a.config.Snapshot()
 	reconcile := false
 	a.mu.Lock()
@@ -282,6 +302,18 @@ func (a *App) Refresh(ctx context.Context, force bool) error {
 	}()
 	if epoch != a.epoch {
 		return nil
+	}
+	if rejected != nil {
+		a.tokens.Rejected = true
+		a.status, a.lastError = "expired", rejected.Error()
+		_ = a.vault.Save(a.tokens)
+		return rejected
+	}
+	if recovered != nil {
+		if saveErr := a.vault.Save(*recovered); saveErr != nil {
+			return saveErr
+		}
+		a.tokens = *recovered
 	}
 	a.lastRefresh = time.Now()
 	if err != nil {
@@ -424,6 +456,24 @@ func (a *App) UpdateSpeaker(ctx context.Context, id string, p SpeakerPatch) erro
 	}
 	next := a.config.Snapshot().Speakers[id]
 	err = a.reconcile(ctx, before, a.config.Snapshot())
+	currentConfig := a.config.Snapshot()
+	if currentConfig.Owner != before.Owner {
+		return err
+	}
+	next = currentConfig.Speakers[id]
+	if p.Volume != nil || p.Muted != nil {
+		route, owned := a.owner(id)
+		r := a.routes[route]
+		if !owned || r == nil || !r.runnable() {
+			a.mu.Lock()
+			v := next.Volume
+			if next.Muted {
+				v = 0
+			}
+			a.rememberVolumeLocked(a.tokens.UserID, id, v)
+			a.mu.Unlock()
+		}
+	}
 	a.mu.RLock()
 	tokens := a.tokens
 	a.mu.RUnlock()
@@ -432,14 +482,23 @@ func (a *App) UpdateSpeaker(ctx context.Context, id string, p SpeakerPatch) erro
 		if next.Muted {
 			volume = 0
 		}
-		err = a.cloud.Command(ctx, tokens, id, "player_set_volume", map[string]any{"media": "app_ios", "volume": volume})
-		if err != nil {
-			a.recordCommand(id, "", err)
+		if route, owned := a.owner(id); owned {
+			r := a.routes[route]
+			if r != nil && r.runnable() {
+				plan := a.planLocked(route, r, next, tokens, "volume", volume)
+				err = errors.Join(err, resultsError(a.executeLocked(ctx, []speakerCommand{plan})))
+			}
 		}
 	}
 	return err
 }
-func (a *App) UpdateSettings(ctx context.Context, mode, selected, name, format string) error {
+
+type SettingsOptions struct {
+	VolumeMode string
+	Equalizer  *store.Equalizer
+}
+
+func (a *App) UpdateSettings(ctx context.Context, mode, selected, name, format string, options ...SettingsOptions) error {
 	a.op.Lock()
 	defer a.op.Unlock()
 	before := a.config.Snapshot()
@@ -448,6 +507,14 @@ func (a *App) UpdateSettings(ctx context.Context, mode, selected, name, format s
 		c.Selected = selected
 		c.Name = name
 		c.Format = format
+		if len(options) > 0 {
+			if options[0].VolumeMode != "" {
+				c.VolumeMode = options[0].VolumeMode
+			}
+			if options[0].Equalizer != nil {
+				c.Equalizer = *options[0].Equalizer
+			}
+		}
 		if mode == "single" {
 			s, ok := c.Speakers[selected]
 			if !ok || !s.Joined {

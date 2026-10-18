@@ -107,3 +107,39 @@ func TestQueueContinuationDoesNotReclaimIndividualSpeaker(t *testing.T) {
 		t.Fatal("queued next song reclaimed newer individual cast", result, err)
 	}
 }
+
+func TestFailedTransportDoesNotCommitRouteState(t *testing.T) {
+	f := &fakeCloud{devices: []xiaomi.Device{{ID: "one", Hardware: "OH2"}}}
+	a := newApp(t, f)
+	ctx := context.Background()
+	_ = a.Refresh(ctx, true)
+	_, _ = a.ControlRoute(ctx, "speaker:one", "play_url", "source", "", 0)
+	f.failure = map[string]bool{"one": true}
+	_, _ = a.ControlRouteSource(ctx, "speaker:one", "source", "pause", 0)
+	if a.routes["speaker:one"].paused {
+		t.Fatal("failed pause committed paused state")
+	}
+	f.failure["one"] = false
+	_, _ = a.ControlRouteSource(ctx, "speaker:one", "source", "pause", 0)
+	f.failure["one"] = true
+	_, _ = a.ControlRouteSource(ctx, "speaker:one", "source", "play", 0)
+	if !a.routes["speaker:one"].paused {
+		t.Fatal("failed resume committed playing state")
+	}
+}
+
+func TestStopReleasesSessionResolver(t *testing.T) {
+	f := &fakeCloud{devices: []xiaomi.Device{{ID: "one", Hardware: "OH2"}}}
+	a := newApp(t, f)
+	ctx := context.Background()
+	_ = a.Refresh(ctx, true)
+	_, err := a.BeginRouteStream(ctx, "speaker:one", "source", "track", func(store.Speaker) string { return "http://renderer/audio" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = a.ControlRouteSource(ctx, "speaker:one", "source", "stop", 0)
+	r := a.routes["speaker:one"]
+	if r.resolver != nil || r.source != "" || r.audioID != "" || len(r.owned) != 0 {
+		t.Fatal("stopped route retained its session resources")
+	}
+}

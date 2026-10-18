@@ -10,8 +10,7 @@ import (
 )
 
 func (c *Client) SearchTrack(ctx context.Context, t Tokens, title, artist string) (string, error) {
-	title = strings.TrimSpace(title)
-	artist = strings.TrimSpace(artist)
+	title, artist = normalizeMetadata(title, artist)
 	if title == "" {
 		return "", nil
 	}
@@ -41,7 +40,7 @@ func (c *Client) SearchTrack(ctx context.Context, t Tokens, title, artist string
 		return "", err
 	}
 	for _, song := range data.Songs {
-		if !strings.EqualFold(strings.TrimSpace(song.Name), title) {
+		if !strings.EqualFold(normalizeSpace(song.Name), title) {
 			continue
 		}
 		sa := strings.ToLower(song.Artist.Name)

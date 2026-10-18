@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -148,7 +149,16 @@ type Speaker struct {
 	Format     string `json:"format"`
 	Muted      bool   `json:"muted"`
 }
+type Equalizer struct {
+	Enabled bool    `json:"enabled"`
+	Bass    float64 `json:"bass"`
+	Mid     float64 `json:"mid"`
+	Treble  float64 `json:"treble"`
+}
+
 type Config struct {
+	Equalizer     Equalizer          `json:"equalizer"`
+	VolumeMode    string             `json:"volume_mode"`
 	SchemaVersion int                `json:"schema_version,omitempty"`
 	Owner         string             `json:"owner,omitempty"`
 	Name          string             `json:"name"`
@@ -164,7 +174,7 @@ type ConfigStore struct {
 }
 
 func NewConfig(dir string) (*ConfigStore, error) {
-	s := &ConfigStore{path: filepath.Join(dir, "config.json"), value: Config{SchemaVersion: 2, Name: "MiCast Go", Mode: "whole_house", Format: "mp3", Speakers: map[string]Speaker{}}}
+	s := &ConfigStore{path: filepath.Join(dir, "config.json"), value: Config{SchemaVersion: 2, Name: "MiCast Go", Mode: "whole_house", Format: "mp3", VolumeMode: "independent", Speakers: map[string]Speaker{}}}
 	b, err := os.ReadFile(s.path)
 	if err == nil {
 		s.value.SchemaVersion = 0
@@ -217,6 +227,14 @@ func (s *ConfigStore) Update(fn func(*Config) error) error {
 	return nil
 }
 func validate(c Config) error {
+	for _, gain := range []float64{c.Equalizer.Bass, c.Equalizer.Mid, c.Equalizer.Treble} {
+		if math.IsNaN(gain) || math.IsInf(gain, 0) || gain < -12 || gain > 12 {
+			return errors.New("均衡器增益须为 -12 至 12 dB")
+		}
+	}
+	if c.VolumeMode != "" && c.VolumeMode != "independent" && c.VolumeMode != "linked" {
+		return errors.New("无效手机音量模式")
+	}
 	if len(c.Name) == 0 || len(c.Name) > 100 {
 		return errors.New("名称长度须为 1～100 字节")
 	}

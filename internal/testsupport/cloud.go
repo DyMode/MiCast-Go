@@ -13,8 +13,10 @@ import (
 
 type Play struct{ ID, URL, AudioID string }
 type Cloud struct {
-	Plays       chan Play
-	DevicesList []xiaomi.Device
+	Plays         chan Play
+	DevicesList   []xiaomi.Device
+	BeforePlay    func(context.Context, Play) error
+	BeforeCommand func(context.Context, string, string, map[string]any) error
 }
 
 func (c *Cloud) StartQR(context.Context) (xiaomi.QR, error) {
@@ -32,10 +34,18 @@ func (c *Cloud) Devices(context.Context, xiaomi.Tokens) ([]xiaomi.Device, error)
 	}
 	return []xiaomi.Device{{ID: "speaker", Name: "测试音箱", Hardware: "OH2"}}, nil
 }
-func (c *Cloud) Command(context.Context, xiaomi.Tokens, string, string, map[string]any) error {
+func (c *Cloud) Command(ctx context.Context, _ xiaomi.Tokens, id, method string, args map[string]any) error {
+	if c.BeforeCommand != nil {
+		return c.BeforeCommand(ctx, id, method, args)
+	}
 	return nil
 }
-func (c *Cloud) PlayURL(_ context.Context, _ xiaomi.Tokens, id, hardware, url, audioID string) error {
+func (c *Cloud) PlayURL(ctx context.Context, _ xiaomi.Tokens, id, hardware, url, audioID string) error {
+	if c.BeforePlay != nil {
+		if err := c.BeforePlay(ctx, Play{id, url, audioID}); err != nil {
+			return err
+		}
+	}
 	select {
 	case c.Plays <- Play{id, url, audioID}:
 	default:
