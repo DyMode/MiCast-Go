@@ -1,5 +1,5 @@
 appname=micast-go
-version=0.1.0
+version=0.1.1
 display_name=MiCast Go
 desc="""把手机和电脑里的声音，交给家里的小米音箱。
 
@@ -28,4 +28,4 @@ desktop_applaunchname=micast-go.main
 ctl_stop=true
 checkport=false
 disable_authorization_path=true
-changelog=0.1.0<br>【首次发布】米家扫码登录、登录状态保存与自动续期。<br>【投送】每台音箱独立的经典 AirPlay / DLNA 入口，支持全屋播放与逐台成员开关。<br>【播放】音频链接播放、暂停、停止，以及音量、静音和延迟调节。<br>【格式】支持 MP3、FLAC、WAV、PCM 音频输出。<br>【显示】歌曲信息匹配与带屏音箱显示。<br>【管理】可选管理密码登录、用户协议、隐私政策、联系反馈与赞赏开发。<br>【安装】支持 x86-64 / ARM64，升级保留配置，卸载可选择保留全部、仅删除登录或删除全部应用数据。
+changelog=0.1.1<br>【修复】DLNA 连续播放与进度显示问题。<br>【优化】投送响应速度和换歌衔接。<br>【修复】AirPlay 播放状态显示。<br>【新增】诊断报告导出。<br>【调整】卸载“删除全部”的数据清理范围。

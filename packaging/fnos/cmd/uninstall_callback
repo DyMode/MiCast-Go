@@ -22,7 +22,12 @@ remove_all)
     app_dir="$(readlink -f -- "$TRIM_APPDEST")"
     case "$app_dir" in "$data_dir"|"$data_dir"/*) exit 1 ;; esac
   fi
-  find "$data_dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  # Remove only app-private state. The app files directory may contain
+  # user-visible files such as diagnostics reports, so unknown entries are
+  # preserved; the uninstall wizard states this explicitly.
+  for name in account.key account.enc access.key admin-password config.json advertise-ip upgrade-backup cache micast-go.log micast-go.log.1 micast-go.pid service.lock; do
+    rm -rf -- "$data_dir/$name"
+  done
   ;;
 *) exit 1 ;;
 esac
