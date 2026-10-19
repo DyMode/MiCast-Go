@@ -1,5 +1,5 @@
 appname=micast-go
-version=0.1.3
+version=0.1.2
 display_name=MiCast Go
 desc="""把手机和电脑里的声音，交给家里的小米音箱。
 
@@ -28,4 +28,4 @@ desktop_applaunchname=micast-go.main
 ctl_stop=true
 checkport=false
 disable_authorization_path=true
-changelog=0.1.3<br>【优化】图标外轮廓改为 n=3 超椭圆，四边切点贴边，更贴合飞牛桌面风格。<br>【优化】保留 32–512 全套尺寸与 64px 加粗描边。
+changelog=0.1.2<br>【优化】图标外轮廓改为 n=3 超椭圆，四边切点贴边，更贴合飞牛桌面风格。<br>【优化】补齐 32–512 全套尺寸与 64px 加粗描边，修复高分屏马赛克。
