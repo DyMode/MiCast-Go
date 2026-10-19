@@ -15,6 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -277,6 +278,24 @@ func outerReader(file *os.File) (io.Reader, io.Closer, error) {
 	}
 	return file, nil, nil
 }
+
+const maxIconBytes = 1024 * 1024
+
+func validateIcon(data []byte, size int) error {
+	if len(data) > maxIconBytes {
+		return fmt.Errorf("%dx%d icon exceeds 1024 KB", size, size)
+	}
+	if len(data) < 33 || string(data[:8]) != "\x89PNG\r\n\x1a\n" || string(data[12:16]) != "IHDR" {
+		return fmt.Errorf("%dx%d icon is not a valid PNG", size, size)
+	}
+	width := binary.BigEndian.Uint32(data[16:20])
+	height := binary.BigEndian.Uint32(data[20:24])
+	if width != uint32(size) || height != uint32(size) {
+		return fmt.Errorf("expected %dx%d icon, got %dx%d", size, size, width, height)
+	}
+	return nil
+}
+
 func validate(filename, platform string) error {
 	if platform != "x86" && platform != "arm" {
 		return errors.New("unknown FPK platform")
@@ -331,6 +350,19 @@ func validate(filename, platform string) error {
 		if name == "cmd/main" && h.Mode&0111 == 0 {
 			return errors.New("lifecycle script is not executable")
 		}
+		if name == "ICON.PNG" || name == "ICON_256.PNG" {
+			b, err := io.ReadAll(io.LimitReader(in, maxIconBytes+1))
+			if err != nil {
+				return err
+			}
+			size := 64
+			if name == "ICON_256.PNG" {
+				size = 256
+			}
+			if err := validateIcon(b, size); err != nil {
+				return err
+			}
+		}
 		if name == "app.tgz" {
 			digest := md5.New()
 			tee := io.TeeReader(in, digest)
@@ -354,6 +386,19 @@ func validate(filename, platform string) error {
 				appFound[p] = true
 				if strings.Contains(p, "account.enc") || strings.Contains(p, "access.key") || strings.HasPrefix(p, "vendor/") {
 					return errors.New("unexpected credentials or Python dependencies in package")
+				}
+				if strings.HasPrefix(p, "ui/images/icon_") && strings.HasSuffix(p, ".png") {
+					size, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(p, "ui/images/icon_"), ".png"))
+					if err != nil || size <= 0 {
+						return fmt.Errorf("invalid icon name: %s", p)
+					}
+					b, err := io.ReadAll(io.LimitReader(app, maxIconBytes+1))
+					if err != nil {
+						return err
+					}
+					if err := validateIcon(b, size); err != nil {
+						return err
+					}
 				}
 				if p == "bin/micast-go" || p == "audio/ffmpeg" {
 					if entry.Mode&0111 == 0 {
@@ -390,7 +435,7 @@ func validate(filename, platform string) error {
 			return fmt.Errorf("FPK missing %s", name)
 		}
 	}
-	for _, name := range []string{"bin/micast-go", "audio/ffmpeg", "ui/config", "ui/images/icon_64.png", "ui/images/icon_256.png", "licenses/ffmpeg/LICENSE.txt"} {
+	for _, name := range []string{"bin/micast-go", "audio/ffmpeg", "ui/config", "ui/images/icon_64.png", "ui/images/icon_128.png", "ui/images/icon_256.png", "licenses/ffmpeg/LICENSE.txt"} {
 		if !appFound[name] {
 			return fmt.Errorf("app missing %s", name)
 		}

@@ -5,12 +5,23 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/binary"
+	"image"
+	"image/png"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func iconPNG(t *testing.T, size int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, size, size))); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
 
 func fixture(t *testing.T) (string, string) {
 	t.Helper()
@@ -23,7 +34,7 @@ func fixture(t *testing.T) (string, string) {
 	elf[4] = 2
 	elf[5] = 1
 	binary.LittleEndian.PutUint16(elf[18:], 62)
-	for name, data := range map[string][]byte{"bin/micast-go": elf, "audio/ffmpeg": elf, "ui/config": []byte(`{}`), "ui/images/icon_64.png": []byte("png"), "ui/images/icon_256.png": []byte("png"), "licenses/ffmpeg/LICENSE.txt": []byte("license")} {
+	for name, data := range map[string][]byte{"bin/micast-go": elf, "audio/ffmpeg": elf, "ui/config": []byte(`{}`), "ui/images/icon_64.png": iconPNG(t, 64), "ui/images/icon_128.png": iconPNG(t, 128), "ui/images/icon_256.png": iconPNG(t, 256), "licenses/ffmpeg/LICENSE.txt": []byte("license")} {
 		app.WriteHeader(&tar.Header{Name: name, Mode: 0666, Size: int64(len(data)), Typeflag: tar.TypeReg})
 		app.Write(data)
 	}
@@ -35,7 +46,7 @@ func fixture(t *testing.T) (string, string) {
 	}
 	outerGzip := gzip.NewWriter(file)
 	outer := tar.NewWriter(outerGzip)
-	for name, data := range map[string][]byte{"app.tgz": payload.Bytes(), "manifest": []byte("appname = old\r\nchecksum=old\r\n"), "cmd/main": []byte("#!/bin/bash\n"), "cmd/install_callback": []byte("exit 0\n"), "config/privilege": []byte(`{}`), "wizard/install": []byte(`[]`), "ICON.PNG": []byte("png"), "ICON_256.PNG": []byte("png")} {
+	for name, data := range map[string][]byte{"app.tgz": payload.Bytes(), "manifest": []byte("appname = old\r\nchecksum=old\r\n"), "cmd/main": []byte("#!/bin/bash\n"), "cmd/install_callback": []byte("exit 0\n"), "config/privilege": []byte(`{}`), "wizard/install": []byte(`[]`), "ICON.PNG": iconPNG(t, 64), "ICON_256.PNG": iconPNG(t, 256)} {
 		outer.WriteHeader(&tar.Header{Name: name, Mode: 0666, Size: int64(len(data)), Typeflag: tar.TypeReg})
 		outer.Write(data)
 	}
@@ -102,6 +113,18 @@ func TestUnsafeArchivePathsRejected(t *testing.T) {
 		if _, err := clean(name); err == nil {
 			t.Fatal("unsafe archive path", name)
 		}
+	}
+}
+
+func TestIconValidationRejectsWrongSizeAndFormat(t *testing.T) {
+	if err := validateIcon(iconPNG(t, 64), 64); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateIcon(iconPNG(t, 32), 64); err == nil {
+		t.Fatal("wrong icon size accepted")
+	}
+	if err := validateIcon([]byte("png"), 64); err == nil {
+		t.Fatal("non-PNG icon accepted")
 	}
 }
 

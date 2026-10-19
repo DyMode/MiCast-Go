@@ -63,10 +63,10 @@ foreach ($target in $platforms) {
     foreach ($notice in @('LICENSE.txt','LAME-COPYING','MUSL-COPYRIGHT','ZIG-LICENSE','BUILD-INFO.json','readme.txt')) { Copy-Item -LiteralPath (Join-Path $runtime $notice) -Destination (Join-Path $stageApp ('licenses/ffmpeg/'+$notice)) }
     Copy-Item -Path (Join-Path $projectRoot 'licenses/*') -Destination (Join-Path $stageApp 'licenses') -Recurse -Force
     Copy-Item -LiteralPath LICENSE -Destination (Join-Path $stageApp 'LICENSE')
-    foreach ($size in @(64,256)) { Copy-Item -LiteralPath (Join-Path $projectRoot ('assets/icons/micast-go-'+$size+'.png')) -Destination (Join-Path $stageApp ('ui/images/icon_'+$size+'.png')) }
+    foreach ($size in @(32,48,64,96,128,192,256,512)) { Copy-Item -LiteralPath (Join-Path $projectRoot ('assets/icons/micast-go-'+$size+'.png')) -Destination (Join-Path $stageApp ('ui/images/icon_'+$size+'.png')) }
     Copy-Item -LiteralPath assets/icons/micast-go-64.png -Destination (Join-Path $stage 'ICON.PNG')
     Copy-Item -LiteralPath assets/icons/micast-go-256.png -Destination (Join-Path $stage 'ICON_256.PNG')
-    $manifest=Get-Content (Join-Path $stage 'manifest') -Raw
+    $manifest=Get-Content (Join-Path $stage 'manifest') -Raw -Encoding UTF8
     [IO.File]::WriteAllText((Join-Path $stage 'manifest'),[regex]::Replace($manifest,'(?m)^platform=.+$','platform='+$target).Replace("`r`n","`n"),[Text.UTF8Encoding]::new($false))
     foreach ($script in (Get-ChildItem (Join-Path $stage 'cmd') -File)) { $text=[IO.File]::ReadAllText($script.FullName);[IO.File]::WriteAllText($script.FullName,$text.Replace("`r`n","`n"),[Text.UTF8Encoding]::new($false)) }
     Push-Location $stage
