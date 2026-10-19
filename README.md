@@ -3,7 +3,7 @@
 <p align="center">将手机、电脑上的音频投送到小米智能音箱，支持单台播放与全屋播放。</p>
 
 <p align="center">
-  <a href="https://github.com/DyMode/MiCast-Go/releases/latest"><img src="https://img.shields.io/badge/版本-0.1.2-237c83?style=flat-square" alt="版本 0.1.2"></a>
+  <a href="https://github.com/DyMode/MiCast-Go/releases/latest"><img src="https://img.shields.io/badge/版本-0.1.3-237c83?style=flat-square" alt="版本 0.1.3"></a>
   <img src="https://img.shields.io/badge/适用平台-飞牛_fnOS-527275?style=flat-square" alt="适用飞牛 fnOS">
   <a href="LICENSE"><img src="https://img.shields.io/badge/许可-MIT-527275?style=flat-square" alt="MIT 许可"></a>
 </p>
@@ -30,8 +30,8 @@
 
 | NAS 架构 | 安装包 |
 | --- | --- |
-| x86-64 | [micast-go-x86-0.1.2.fpk](https://github.com/DyMode/MiCast-Go/releases/download/v0.1.2/micast-go-x86-0.1.2.fpk) |
-| ARM64 | [micast-go-arm-0.1.2.fpk](https://github.com/DyMode/MiCast-Go/releases/download/v0.1.2/micast-go-arm-0.1.2.fpk) |
+| x86-64 | [micast-go-x86-0.1.3.fpk](https://github.com/DyMode/MiCast-Go/releases/download/v0.1.3/micast-go-x86-0.1.3.fpk) |
+| ARM64 | [micast-go-arm-0.1.3.fpk](https://github.com/DyMode/MiCast-Go/releases/download/v0.1.3/micast-go-arm-0.1.3.fpk) |
 
 点击音箱的房屋图标加入全屋播放，选择“MiCast Go”入口即可向已加入的音箱播放。
 
