@@ -1,5 +1,5 @@
 appname=micast-go
-version=0.1.1
+version=0.1.2
 display_name=MiCast Go
 desc="""把手机和电脑里的声音，交给家里的小米音箱。
 
@@ -28,4 +28,4 @@ desktop_applaunchname=micast-go.main
 ctl_stop=true
 checkport=false
 disable_authorization_path=true
-changelog=0.1.1<br>【修复】DLNA 连续播放与进度显示问题。<br>【优化】投送响应速度和换歌衔接。<br>【修复】AirPlay 播放状态显示。<br>【新增】诊断报告导出。<br>【调整】卸载“删除全部”的数据清理范围。
+changelog=0.1.2<br>【优化】应用图标改为满画布，补齐 128px 等多尺寸，改善飞牛桌面的显示大小与清晰度。<br>【修复】图标居中与高分屏马赛克问题。<br>【优化】打包时校验图标尺寸、格式和 sRGB 配置。

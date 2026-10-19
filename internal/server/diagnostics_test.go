@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"micastgo/internal/version"
 )
 
 func TestDiagnosticExportWritesUserFile(t *testing.T) {
@@ -32,7 +34,7 @@ func TestDiagnosticExportWritesUserFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(raw)
-	if !strings.Contains(text, "MiCast Go 诊断报告") || !strings.Contains(text, "version=0.1.1") {
+	if !strings.Contains(text, "MiCast Go 诊断报告") || !strings.Contains(text, "version="+version.Version) {
 		t.Fatal(text)
 	}
 	if strings.Contains(text, key) {
