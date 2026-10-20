@@ -68,19 +68,11 @@ class Lifecycle(unittest.TestCase):
 
     def test_install_without_password_and_reinstall_preserves_credentials(self):
         before = self.seed()
-        self.runhook("install_init", wizard_legal_accept="2026-10-16")
+        self.runhook("install_init")
         self.runhook("install_callback")
         self.runhook("install_callback")
         self.assertEqual(before, {name: (self.data / name).read_bytes() for name in before})
         self.assertIn("chown -R -H fixture-user", self.log.read_text(encoding="utf-8"))
-
-    def test_install_requires_current_legal_acceptance(self):
-        self.runhook("install_init", expected=1, wizard_legal_accept="")
-        self.runhook("install_init", expected=1, wizard_legal_accept="old")
-        self.runhook("install_init", expected=1, wizard_legal_accept='["old","2026-10-16"]')
-        self.runhook("install_init", wizard_legal_accept="2026-10-16")
-        self.runhook("install_init", wizard_legal_accept='[ "2026-10-16" ]')
-        self.runhook("install_init", wizard_legal_accept='"2026-10-16"')
 
     def test_upgrade_stops_before_backup_and_removes_obsolete_backup(self):
         before = self.seed()

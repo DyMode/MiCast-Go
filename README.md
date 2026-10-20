@@ -26,7 +26,7 @@
 
 ## 📦 飞牛安装
 
-从 [发布页](https://github.com/DyMode/MiCast-Go/releases/latest) 下载适合自己 NAS 的安装包，在应用中心手动安装，阅读并同意用户协议与隐私政策。打开应用后扫码连接米家。
+从 [发布页](https://github.com/DyMode/MiCast-Go/releases/latest) 下载适合自己 NAS 的安装包，在应用中心手动安装并同意许可协议。打开应用后扫码连接米家。
 
 | NAS 架构 | 安装包 |
 | --- | --- |

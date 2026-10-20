@@ -28,6 +28,10 @@ for platform, arch, machine in [("x86", "amd64", 62), ("arm", "arm64", 183)]:
         assert packaged_manifest.rstrip() == expected_manifest.rstrip(), "Packaged manifest differs from reviewed source"
         assert "version=" + VERSION + "\n" in manifest
         assert "platform=" + platform + "\n" in manifest
+        license_text = outer.extractfile("LICENSE").read()
+        assert license_text.replace(b"\r\n", b"\n") == (ROOT / "packaging/fnos/LICENSE").read_bytes().replace(b"\r\n", b"\n"), "Packaged LICENSE differs from reviewed source"
+        wizard = outer.extractfile("wizard/install").read()
+        assert wizard.replace(b"\r\n", b"\n") == (ROOT / "packaging/fnos/wizard/install").read_bytes().replace(b"\r\n", b"\n"), "Install wizard differs from reviewed source"
         app = outer.extractfile("app.tgz").read()
         assert hashlib.md5(app).hexdigest() in manifest, "app.tgz MD5 mismatch"
         hooks = []
@@ -44,6 +48,7 @@ for platform, arch, machine in [("x86", "amd64", 62), ("arm", "arm64", 183)]:
         names = {member.name.removeprefix("./") for member in members}
         assert "licenses/lucide.txt" in names
         assert "licenses/ffmpeg/LICENSE.txt" in names
+        assert inner.extractfile("LICENSE").read().startswith(b"MIT License"), "Application LICENSE is not the MIT text"
         build_info = json.load(inner.extractfile("licenses/ffmpeg/BUILD-INFO.json"))
         assert build_info["license"] == "LGPL-2.1-or-later"
         locked = next(item for item in runtime_locks if item["arch"] == arch)

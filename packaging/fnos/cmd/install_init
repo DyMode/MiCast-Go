@@ -1,15 +1,6 @@
 #!/bin/bash
 set -eu
 umask 077
-consent="${wizard_legal_accept:-}"
-consent="${consent//[[:space:]]/}"
-case "$consent" in
-  '2026-10-16'|'"2026-10-16"'|'["2026-10-16"]') ;;
-  *)
-  echo "请阅读并同意用户协议与隐私政策后安装。" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
-  exit 1
-  ;;
-esac
 for dependency in curl runuser readlink; do
   if ! command -v "$dependency" >/dev/null 2>&1; then
     echo "系统缺少 $dependency，无法启动应用。" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
