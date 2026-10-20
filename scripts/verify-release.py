@@ -30,8 +30,9 @@ for platform, arch, machine in [("x86", "amd64", 62), ("arm", "arm64", 183)]:
         assert "platform=" + platform + "\n" in manifest
         license_text = outer.extractfile("LICENSE").read()
         assert license_text.replace(b"\r\n", b"\n") == (ROOT / "packaging/fnos/LICENSE").read_bytes().replace(b"\r\n", b"\n"), "Packaged LICENSE differs from reviewed source"
-        wizard = outer.extractfile("wizard/install").read()
-        assert wizard.replace(b"\r\n", b"\n") == (ROOT / "packaging/fnos/wizard/install").read_bytes().replace(b"\r\n", b"\n"), "Install wizard differs from reviewed source"
+        outer_names = {member.name for member in outer.getmembers()}
+        assert "wizard/install" not in outer_names, "Install wizard must not add a second page"
+        assert "wizard/uninstall" in outer_names
         app = outer.extractfile("app.tgz").read()
         assert hashlib.md5(app).hexdigest() in manifest, "app.tgz MD5 mismatch"
         hooks = []

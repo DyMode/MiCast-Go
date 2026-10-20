@@ -430,7 +430,7 @@ func validate(filename, platform string) error {
 	if manifestChecksum == "" || manifestChecksum != appChecksum {
 		return errors.New("FPK app checksum mismatch")
 	}
-	for _, name := range []string{"manifest", "app.tgz", "cmd/main", "cmd/install_callback", "config/privilege", "wizard/install", "ICON.PNG", "ICON_256.PNG"} {
+	for _, name := range []string{"manifest", "app.tgz", "cmd/main", "cmd/install_callback", "config/privilege", "ICON.PNG", "ICON_256.PNG"} {
 		if !found[name] {
 			return fmt.Errorf("FPK missing %s", name)
 		}

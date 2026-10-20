@@ -46,7 +46,7 @@ func fixture(t *testing.T) (string, string) {
 	}
 	outerGzip := gzip.NewWriter(file)
 	outer := tar.NewWriter(outerGzip)
-	for name, data := range map[string][]byte{"app.tgz": payload.Bytes(), "manifest": []byte("appname = old\r\nchecksum=old\r\n"), "cmd/main": []byte("#!/bin/bash\n"), "cmd/install_callback": []byte("exit 0\n"), "config/privilege": []byte(`{}`), "wizard/install": []byte(`[]`), "ICON.PNG": iconPNG(t, 64), "ICON_256.PNG": iconPNG(t, 256)} {
+	for name, data := range map[string][]byte{"app.tgz": payload.Bytes(), "manifest": []byte("appname = old\r\nchecksum=old\r\n"), "cmd/main": []byte("#!/bin/bash\n"), "cmd/install_callback": []byte("exit 0\n"), "config/privilege": []byte(`{}`), "ICON.PNG": iconPNG(t, 64), "ICON_256.PNG": iconPNG(t, 256)} {
 		outer.WriteHeader(&tar.Header{Name: name, Mode: 0666, Size: int64(len(data)), Typeflag: tar.TypeReg})
 		outer.Write(data)
 	}
